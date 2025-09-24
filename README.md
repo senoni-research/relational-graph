@@ -1,14 +1,45 @@
 # Titanic: KumoRFM vs LightGBM
 
-This repo contains a reproducible notebook comparing KumoRFM to a LightGBM baseline on the Titanic dataset.
+A short, reproducible comparison between KumoRFM and a LightGBM baseline on the Titanic dataset. The notebook runs end‑to‑end and reports AUROC for both methods using the same train/test split.
 
-## Setup
+## Quick start
 
+Prereqs: Python 3.9+ and a working C compiler (for LightGBM wheels, pip will fetch prebuilt binaries on macOS/arm64).
 
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# Launch Jupyter Lab
+jupyter lab
+```
+
+## How to run
+
+1. Open `notebooks/titanic.ipynb` in Jupyter Lab.
+2. Select the `.venv` or `Python (kumo)` kernel.
+3. Run all cells. The notebook will:
+   - Load Titanic from `seaborn` and create a primary key column `id`.
+   - Create a single, shared stratified train/test split keyed by `id`.
+   - KumoRFM: mask test labels, predict with a `PREDICT ... FOR table.id IN (...)` query, and evaluate AUROC by aligning on the returned `ENTITY` IDs.
+   - LightGBM: train with native categoricals and early stopping callbacks, then evaluate AUROC on the same test IDs.
+
+## Authentication (Kumo)
+
+Set your API key once in the environment, or use interactive auth when prompted by the notebook:
+
+```bash
+export KUMO_API_KEY="<your_api_key>"
+```
 
 ## Contents
-- notebooks/titanic.ipynb: End-to-end experiment.
+
+- `notebooks/titanic.ipynb` — the end‑to‑end experiment.
 
 ## Notes
-- Set  in your environment or use interactive auth when prompted.
-- Both methods share the same stratified train/test split keyed by uid=501(senoni) gid=20(staff) groups=20(staff),12(everyone),61(localaccounts),79(_appserverusr),80(admin),81(_appserveradm),701(com.apple.sharepoint.group.1),33(_appstore),98(_lpadmin),100(_lpoperator),204(_developer),250(_analyticsusers),395(com.apple.access_ftp),398(com.apple.access_screensharing),399(com.apple.access_ssh),400(com.apple.access_remote_ae).
+
+- Both methods use the exact same stratified train/test split keyed by `id`.
+- To silence LightGBM training logs, the notebook sets `verbosity=-1` and uses callbacks.
+- For background on single‑table usage in KumoRFM, see the reference tutorial notebook: https://github.com/kumo-ai/kumo-rfm/blob/master/notebooks/single_table.ipynb
