@@ -1,0 +1,12 @@
+{"type":"node","id":"A","attrs":{"type":"person","time":10}}
+{"type":"node","id":"B","attrs":{"type":"person","time":11}}
+{"type":"node","id":"C","attrs":{"type":"person","time":12}}
+{"type":"node","id":"D","attrs":{"type":"org","time":13}}
+{"type":"node","id":"X","attrs":{"type":"org","time":3}}
+{"type":"edge","u":"A","v":"B","attrs":{"time":11,"rel":"knows"}}
+{"type":"edge","u":"B","v":"C","attrs":{"time":12,"rel":"knows"}}
+{"type":"edge","u":"A","v":"X","attrs":{"time":4,"rel":"member_of"}}
+{"type":"edge","u":"X","v":"C","attrs":{"time":5,"rel":"member_of"}}
+{"type":"edge","u":"C","v":"D","attrs":{"time":13,"rel":"works_at"}}
+
+

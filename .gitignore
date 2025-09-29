@@ -1,3 +1,11 @@
+# Ignore setuptools metadata
+*.egg-info/
+
+# Common Python ignores (optional safety)
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+
 .venv/
 .specstory/
 .ipynb_checkpoints/
