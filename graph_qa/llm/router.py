@@ -25,12 +25,17 @@ class Router:
         k_paths: int = 3,
         anchors: Optional[Iterable] = None,
     ) -> Dict[str, Any]:
-        q = question.lower().strip()
+        # Use lowercase only for intent matching; preserve original for entity extraction
+        q_lower = question.lower().strip()
 
         # Relationship: route to find_paths if two tokens A-B present
-        m = re.findall(r"between\s+([^\s]+)\s+and\s+([^\s\?\.]+)", q)
-        if "relationship" in q and m:
-            a, b = m[0]
+        m = re.findall(r"between\s+([^\s]+)\s+and\s+([^\s\?\.]+)", question, flags=re.IGNORECASE)
+        if "relationship" in q_lower and m:
+            a_raw, b_raw = m[0]
+            # Map tokens case-insensitively to existing node IDs
+            node_map = {str(n).lower(): n for n in G.nodes}
+            a = node_map.get(str(a_raw).lower(), a_raw)
+            b = node_map.get(str(b_raw).lower(), b_raw)
             paths = find_paths(G, a, b, max_len=max_len, k=k_paths)
             return {
                 "result": {"paths": [p.model_dump() for p in paths]},
@@ -40,7 +45,7 @@ class Router:
             }
 
         # Predict structure
-        if "predict" in q and "subgraph" in q:
+        if "predict" in q_lower and "subgraph" in q_lower:
             anc = list(anchors or [])
             res = predict_subgraph(G, anc)
             return {
@@ -51,7 +56,7 @@ class Router:
             }
 
         # Causal queries: return influence proxy disclaimer
-        if "cause" in q or "causes" in q or "causal" in q:
+        if "cause" in q_lower or "causes" in q_lower or "causal" in q_lower:
             return {
                 "result": {"message": "Causal inference not configured; returning non-causal influence proxy."},
                 "method": [],
