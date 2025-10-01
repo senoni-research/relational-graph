@@ -1,4 +1,4 @@
-## LLM × RELGT Subgraph Prediction & Graph QA (MVP)
+## Relational Graph: Subgraph Prediction & LLM QA (MVP)
 
 ### Overview
 Graph-structured QA that predicts structure (subgraphs), not just links. We score edges in a fixed-K temporal egonet and decode the most likely connecting subgraph between anchors using k-shortest paths and a Steiner-tree fallback. An LLM-style router calls tools to answer natural-language questions with method, evidence, and caveats.
@@ -21,18 +21,18 @@ Demo data lives in `graph_qa/data/demo_graph.jsonl`. A simple demo notebook is i
 
 - Relationship QA (top-k paths):
 ```bash
-graph-qa find-paths --graph graph_qa/data/demo_graph.jsonl --a A --b C --max-len 4 --k 2
+relational-graph find-paths --graph graph_qa/data/demo_graph.jsonl --a A --b C --max-len 4 --k 2
 ```
 
 - Predict subgraph (structure):
 ```bash
-graph-qa predict-subgraph --graph graph_qa/data/demo_graph.jsonl --a A --b C --anchor-time 12 --hops 2 --K 50
+relational-graph predict-subgraph --graph graph_qa/data/demo_graph.jsonl --a A --b C --anchor-time 12 --hops 2 --K 50
 ```
 
 - LLM router (stubbed deterministic):
 ```bash
-graph-qa ask --graph graph_qa/data/demo_graph.jsonl --question "What is the relationship between A and C?"
-graph-qa ask --graph graph_qa/data/demo_graph.jsonl --question "What is the likelihood that A causes C?"
+relational-graph ask --graph graph_qa/data/demo_graph.jsonl --question "What is the relationship between A and C?"
+relational-graph ask --graph graph_qa/data/demo_graph.jsonl --question "What is the likelihood that A causes C?"
 ```
 
 ### What’s inside
@@ -95,7 +95,7 @@ pytest -q
 ### Notes & Caveats
 - Causal questions: the router returns association/influence proxies and lists assumptions unless a causal engine is enabled.
 - `torch_geometric` is optional (not required for MVP); we rely on NetworkX for decoding.
-- The CLI script name is `graph-qa` (see `[project.scripts]` in `pyproject.toml`).
+- The CLI script name is `relational-graph` (see `[project.scripts]` in `pyproject.toml`).
 
 ### References
 - RELGT: paper [`arxiv.org/abs/2505.10960`](https://arxiv.org/abs/2505.10960) · code [`github.com/snap-stanford/relgt`](https://github.com/snap-stanford/relgt)
