@@ -35,6 +35,26 @@ relational-graph ask --graph graph_qa/data/demo_graph.jsonl --question "What is 
 relational-graph ask --graph graph_qa/data/demo_graph.jsonl --question "What is the likelihood that A causes C?"
 ```
 
+### Team action step (POC in ~10 minutes)
+- Install and run the demo (above) to verify your environment.
+- Export a tiny slice of your own data to the repo JSONL format and ask a relationship question.
+
+1) Create a JSONL graph (primary/foreign keys → edges)
+```json
+{"type":"node","id":"store:123","attrs":{"type":"store","region":"TX"}}
+{"type":"node","id":"product:ABC","attrs":{"type":"product","category":"dairy"}}
+{"type":"edge","u":"store:123","v":"product:ABC","attrs":{"rel":"sold","time":20250928,"units":7}}
+{"type":"edge","u":"store:123","v":"product:ABC","attrs":{"rel":"has_inventory","time":20250927,"qty":12}}
+```
+Save as `graph_qa/data/my_graph.jsonl`.
+
+2) Ask a question on your graph
+```bash
+relational-graph ask --graph graph_qa/data/my_graph.jsonl --question "What is the relationship between store 123 and product ABC?"
+```
+
+- Next milestone (internal): swap the stub scorer for a learned scorer (RelGT/Griffin) and add a non-causal influence tool for "likelihood/causes" queries. No CLI changes required.
+
 ### What’s inside
 ```
 graph_qa/
