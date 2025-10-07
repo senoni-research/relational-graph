@@ -14,10 +14,23 @@ def _node_time(G: nx.Graph, n) -> float:
 
 
 def _edge_time(G: nx.Graph, u, v) -> float:
-    t = G.edges[u, v].get("time")
-    if t is None:
+    """Get earliest edge time for (u,v). Handles MultiGraph."""
+    if not G.has_edge(u, v):
         return float("-inf")
-    return float(t)
+    
+    if isinstance(G, nx.MultiGraph):
+        # MultiGraph: iterate over all parallel edges to find min time
+        times = []
+        for key in G[u][v]:
+            attrs = G[u][v][key]
+            times.append(attrs.get("time", float("-inf")))
+        return min(times) if times else float("-inf")
+    else:
+        # Simple Graph
+        t = G.edges[u, v].get("time")
+        if t is None:
+            return float("-inf")
+        return float(t)
 
 
 def sample_temporal_egonet(
@@ -76,7 +89,20 @@ def sample_temporal_egonet(
     for u in H.nodes:
         for v in G.neighbors(u):
             if v in H and _edge_time(G, u, v) <= anchor_time:
-                H.add_edge(u, v, **G.edges[u, v])
+                # For MultiGraph, copy the earliest edge; for Graph, copy the single edge
+                if isinstance(G, nx.MultiGraph):
+                    # Find earliest edge key
+                    earliest_key = None
+                    earliest_time = float("inf")
+                    for key in G[u][v]:
+                        t = G[u][v][key].get("time", float("inf"))
+                        if t < earliest_time:
+                            earliest_time = t
+                            earliest_key = key
+                    if earliest_key is not None:
+                        H.add_edge(u, v, **G[u][v][earliest_key])
+                else:
+                    H.add_edge(u, v, **G.edges[u, v])
 
     if H.number_of_nodes() <= K:
         return H

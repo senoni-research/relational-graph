@@ -35,6 +35,55 @@ relational-graph ask --graph graph_qa/data/demo_graph.jsonl --question "What is 
 relational-graph ask --graph graph_qa/data/demo_graph.jsonl --question "What is the likelihood that A causes C?"
 ```
 
+### Team action step (POC with VN2 data)
+
+**Quick demo (5 min)**
+```bash
+source .venv/bin/activate
+relational-graph ask --graph graph_qa/data/vn2_graph_sample.jsonl --question "What is the relationship between store:0 and product:126?"
+```
+
+**Full workflow (train your own scorer)**
+
+1) Convert VN2 CSVs to graph
+```bash
+python scripts/vn2_to_jsonl.py \
+  --vn2-data-dir ../vn2inventory/data \
+  --out graph_qa/data/vn2_graph_full.jsonl \
+  --max-pairs 0  # 0 = all pairs
+```
+
+2) Train edge scorer (masked-edge objective)
+```bash
+relational-graph train-scorer \
+  --graph graph_qa/data/vn2_graph_full.jsonl \
+  --train-end 2024-01-31 \
+  --val-end 2024-03-15 \
+  --epochs 10 \
+  --batch-size 32 \
+  --out checkpoints/vn2_scorer.pt
+```
+This learns p(edge | graph context) on temporal train split; validates on held-out weeks.
+
+3) Evaluate on test set
+```bash
+python scripts/evaluate_scorer.py \
+  --graph graph_qa/data/vn2_graph_full.jsonl \
+  --ckpt checkpoints/vn2_scorer.pt
+```
+Reports AUC/AP on edges after 2024-03-15 (temporal test split).
+
+4) Query with learned probabilities
+```bash
+relational-graph predict-subgraph \
+  --graph graph_qa/data/vn2_graph_full.jsonl \
+  --a store:5 --b product:124 \
+  --scorer-ckpt checkpoints/vn2_scorer.pt
+```
+Returns edges with learned p(e); paths ranked by cost = −log p(e).
+
+**Next milestone**: Add non-causal "influence" tool for "likelihood/causes" queries using time-respecting paths.
+
 ### What’s inside
 ```
 graph_qa/

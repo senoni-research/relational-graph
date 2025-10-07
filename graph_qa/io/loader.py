@@ -7,17 +7,17 @@ from typing import Any, Dict
 import networkx as nx
 
 
-def load_graph(path: str) -> nx.Graph:
+def load_graph(path: str, multi: bool = False) -> nx.Graph:
     """
     Load a graph from a JSONL file with records:
       - {"type":"node","id":<node_id>,"attrs":{...}}
       - {"type":"edge","u":<u>,"v":<v>,"attrs":{...}}
-    Returns an undirected NetworkX Graph with node/edge attributes.
+    Returns an undirected NetworkX Graph (or MultiGraph if multi=True) with node/edge attributes.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(path)
 
-    G = nx.Graph()
+    G = nx.MultiGraph() if multi else nx.Graph()
     if path.endswith(".jsonl"):
         with open(path, "r", encoding="utf-8") as f:
             for line in f:

@@ -8,10 +8,12 @@ import networkx as nx
 from ..io.loader import load_graph
 from ..sampling.temporal_egonet import sample_temporal_egonet
 from ..scoring.relgt_stub import StubRELGTScorer
+from ..scoring.learned_scorer import LearnedEdgeScorer
 from ..decode.costs import edge_costs
 from ..decode.ksp import top_k_paths
 from ..decode.steiner import steiner_connect
 from ..decode.complete import complete_subgraph
+import os
 
 Edge = Tuple[Any, Any]
 
@@ -44,10 +46,17 @@ def predict_subgraph(
     anchor_time: Optional[float] = None,
     k_paths: int = 3,
     cutoff_len: int = 6,
+    scorer_ckpt: Optional[str] = None,
 ) -> Dict[str, Any]:
     anchors = list(anchors)
     sub = sample_temporal_egonet(G, anchors, hops=hops, K=K, anchor_time=anchor_time)
-    scorer = StubRELGTScorer()
+    
+    # Use learned scorer if checkpoint provided, else stub
+    if scorer_ckpt and os.path.exists(scorer_ckpt):
+        scorer = LearnedEdgeScorer(scorer_ckpt)
+    else:
+        scorer = StubRELGTScorer()
+    
     cand_edges: List[Edge] = list(sub.edges)
     probs = scorer.score(sub, cand_edges)
     costs = edge_costs(probs)
