@@ -23,7 +23,7 @@ def evaluate_scorer(
     K: int = 150,
 ):
     print(f"Loading graph from {graph_path}...")
-    G = load_graph(graph_path)
+    G = load_graph(graph_path, multi=True)
     print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
     print(f"Building test set (> {val_end})...")
@@ -38,13 +38,16 @@ def evaluate_scorer(
     
     if is_enhanced:
         print("  → Detected enhanced model")
-        # Build categorical attrs from the checkpoint state
-        cat_attrs = {}
-        for key in ckpt["model_state"].keys():
-            if key.startswith("cat_embeds.") and key.endswith(".weight"):
-                attr_name = key.split(".")[1]
-                vocab_size = ckpt["model_state"][key].shape[0] - 1  # -1 for unknown token
-                cat_attrs[attr_name] = list(range(vocab_size))  # Placeholder values
+        # Use categorical attrs from checkpoint if available
+        cat_attrs = ckpt.get("categorical_attrs")
+        if not cat_attrs:
+            # Fallback to placeholder (not ideal)
+            cat_attrs = {}
+            for key in ckpt["model_state"].keys():
+                if key.startswith("cat_embeds.") and key.endswith(".weight"):
+                    attr_name = key.split(".")[1]
+                    vocab_size = ckpt["model_state"][key].shape[0] - 1
+                    cat_attrs[attr_name] = list(range(vocab_size))
         
         model = EnhancedEdgeScorer(
             node_types=ckpt["node_types"],

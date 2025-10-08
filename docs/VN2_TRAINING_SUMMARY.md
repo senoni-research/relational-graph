@@ -25,9 +25,22 @@ A learned edge scorer that predicts p(store, product) = probability of a meaning
   - Dropout 0.1 for regularization
 - **Data**: Full temporal MultiGraph preserving all 182K edges across 157 weeks (2021-2024)
 - **Training**: 257K samples (128K positive + 129K negative), temporal split
-- **Results**: Currently training; expected AUC 0.70–0.85+ on 45K test samples
+- **Results**: Training infrastructure complete and tested; full training requires GPU or overnight CPU run (~2-4 hours for 15 epochs on CPU; <30 min with GPU)
 
 ## How to use for VN2
+
+### Models: baseline vs enhanced
+
+- Baseline model (`graph_qa/train/model.py`)
+  - Fast, minimal features (node type + mean neighbor aggregation)
+  - Useful for smoke tests, CI, and very limited hardware
+  - Selected by default when you do NOT pass `--use-enhanced`
+- Enhanced model (`graph_qa/train/model_v2.py`)
+  - Rich categorical features (product hierarchy, store format), degree, attention
+  - Preferred for VN2; higher accuracy, heavier compute
+  - Selected with the `--use-enhanced` flag
+
+Why keep both? The baseline provides a quick, deterministic check and a fallback for constrained environments; the enhanced model is the recommended scorer for real results.
 
 ### 1. Generate full temporal graph
 ```bash
@@ -37,16 +50,35 @@ python scripts/vn2_to_jsonl.py \
   --max-pairs 0  # All 599 (store, product) pairs, all 157 weeks
 ```
 
-### 2. Train enhanced scorer (temporal)
+### 2. Train scorer (temporal)
+
+Fast baseline (CPU-friendly):
+```bash
+relational-graph train-scorer \
+  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --train-end 2023-06-30 \
+  --val-end 2023-12-31 \
+  --epochs 10 \
+  --batch-size 512 \
+  --hidden-dim 32 \
+  --num-layers 2 \
+  --K 30 \
+  --hops 1 \
+  --out checkpoints/vn2_scorer_baseline.pt
+```
+
+Enhanced (recommended):
 ```bash
 relational-graph train-scorer \
   --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
   --train-end 2023-06-30 \
   --val-end 2023-12-31 \
   --epochs 15 \
-  --batch-size 64 \
-  --hidden-dim 128 \
-  --num-layers 3 \
+  --batch-size 512 \
+  --hidden-dim 32 \
+  --num-layers 2 \
+  --K 30 \
+  --hops 1 \
   --use-enhanced \
   --out checkpoints/vn2_temporal_scorer.pt
 ```
@@ -98,12 +130,19 @@ The loader uses `nx.MultiGraph()` to preserve all temporal edges (same (store, p
 - Fixed all code paths: dataset iterator, sampler edge access, model forward pass
 - Result: proper training on full 3-year history (2021-2024)
 
+## Performance notes
+- **CPU training**: ~2-4 hours for 15 epochs (257K samples, batch=512, K=30, hidden=32)
+- **Apple Silicon (MPS)**: Auto-detected; training runs on MPS if available and typically 1.5–3× faster than CPU
+- **Recommended**: Run overnight or use GPU/MPS/Colab for faster iteration
+- **Quick baseline**: Use simple model (hidden=32, layers=2, K=30) for POC; scale up later
+
 ## Next steps to improve further
-1. **Change task to regression**: predict `units sold` instead of binary edge existence → direct demand forecast
-2. Add **temporal aggregates** as node features (rolling mean, CV, trend)
-3. Add **co-purchase edges** (product–product if sold together at same store/week)
-4. Train longer (20-30 epochs) with learning rate decay
-5. Ensemble with your existing VN2 forecast models
+1. **Run full training**: Overnight CPU run or cloud GPU (Colab, AWS) for production checkpoint
+2. **Change task to regression**: predict `units sold` instead of binary edge existence → direct demand forecast
+3. Add **temporal aggregates** as node features (rolling mean last 4 weeks, CV, trend)
+4. Add **co-purchase edges** (product–product if sold together at same store/week)
+5. Train longer (20-30 epochs) with learning rate decay
+6. Ensemble with your existing VN2 forecast models
 
 ## VN2 competition benefit
 - **Richer demand signals**: Graph context captures co-movement patterns across stores/products

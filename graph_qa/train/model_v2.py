@@ -31,6 +31,8 @@ class EnhancedEdgeScorer(nn.Module):
         self.type_to_idx = {t: i for i, t in enumerate(node_types)}
         self.categorical_attrs = categorical_attrs
         self.hidden_dim = hidden_dim
+        self.fast_mode = False  # can be toggled by builder
+        self.skip_hopdist = False  # optionally skip hop-distance computation
 
         # Type embedding
         self.type_embed = nn.Embedding(len(node_types), hidden_dim // 2)
@@ -92,16 +94,17 @@ class EnhancedEdgeScorer(nn.Module):
             degrees.append(math.log(deg + 1))
         
         # Convert to tensors
-        type_tensor = torch.LongTensor(type_embeds)
+        device = next(self.parameters()).device
+        type_tensor = torch.LongTensor(type_embeds).to(device)
         type_emb = self.type_embed(type_tensor)  # (N, hidden_dim//2)
         
         cat_emb_parts = []
         for i, (attr_name, _) in enumerate(self.categorical_attrs.items()):
-            cat_indices = torch.LongTensor([c[i] for c in cat_embeds_list])
+            cat_indices = torch.LongTensor([c[i] for c in cat_embeds_list]).to(device)
             cat_emb_parts.append(self.cat_embeds[attr_name](cat_indices))
-        cat_emb = torch.cat(cat_emb_parts, dim=-1) if cat_emb_parts else torch.zeros(len(nodes), 0)
+        cat_emb = torch.cat(cat_emb_parts, dim=-1) if cat_emb_parts else torch.zeros(len(nodes), 0, device=device)
         
-        degree_tensor = torch.FloatTensor(degrees).unsqueeze(-1)
+        degree_tensor = torch.FloatTensor(degrees).unsqueeze(-1).to(device)
         degree_emb = torch.relu(self.degree_mlp(degree_tensor))
         
         # Concatenate all features
@@ -112,32 +115,39 @@ class EnhancedEdgeScorer(nn.Module):
     def encode_nodes(self, G_sub: nx.Graph, nodes: List[Any]) -> torch.Tensor:
         """Encode nodes with attention-based aggregation."""
         x = self.encode_node_features(G_sub, nodes)  # (N, hidden_dim)
+        device = x.device
         
         node_to_idx = {n: i for i, n in enumerate(nodes)}
         
-        # Apply attention layers
-        for attn_layer in self.attn_layers:
-            # Build neighbor context for each node
-            x_with_context = []
+        # Fast mode: skip attention aggregation entirely
+        if not self.fast_mode:
+            # Vectorized neighbor attention on device (avoids Python loops per node)
+            # Build padded neighbor index matrix once and reuse across layers
+            neighbor_indices_list = []
+            max_len = 1
             for i, n in enumerate(nodes):
-                neighbors = list(G_sub.neighbors(n))
-                if neighbors:
-                    neighbor_indices = [node_to_idx[nb] for nb in neighbors if nb in node_to_idx]
-                    if neighbor_indices:
-                        # Self + neighbors
-                        context_indices = [i] + neighbor_indices
-                        context = x[context_indices].unsqueeze(0)  # (1, K, hidden_dim)
-                        query = x[i].unsqueeze(0).unsqueeze(0)  # (1, 1, hidden_dim)
-                        
-                        attn_out, _ = attn_layer(query, context, context)
-                        x_with_context.append(attn_out.squeeze(0).squeeze(0))
-                    else:
-                        x_with_context.append(x[i])
-                else:
-                    x_with_context.append(x[i])
-            
-            x = torch.stack(x_with_context)
-            x = torch.relu(x)
+                neighbors = [node_to_idx[nb] for nb in G_sub.neighbors(n) if nb in node_to_idx]
+                # Include self at position 0
+                indices = [i] + neighbors
+                neighbor_indices_list.append(indices)
+                if len(indices) > max_len:
+                    max_len = len(indices)
+
+            # Create (N, max_len) index tensor and mask
+            context_indices = torch.full((len(nodes), max_len), fill_value=0, dtype=torch.long, device=device)
+            key_padding_mask = torch.ones((len(nodes), max_len), dtype=torch.bool, device=device)
+            for i, indices in enumerate(neighbor_indices_list):
+                L = len(indices)
+                context_indices[i, :L] = torch.tensor(indices, dtype=torch.long, device=device)
+                key_padding_mask[i, :L] = False  # not padded
+
+            for attn_layer in self.attn_layers:
+                # Gather neighbor contexts: (N, max_len, H)
+                context = x[context_indices]
+                # Queries: (N, 1, H)
+                query = x.unsqueeze(1)
+                attn_out, _ = attn_layer(query, context, context, key_padding_mask=key_padding_mask)
+                x = torch.relu(attn_out.squeeze(1))  # (N, H)
         
         return x
 
@@ -148,6 +158,7 @@ class EnhancedEdgeScorer(nn.Module):
         """
         nodes = list(G_sub.nodes)
         node_embeds = self.encode_nodes(G_sub, nodes)
+        device = node_embeds.device
         node_to_idx = {n: i for i, n in enumerate(nodes)}
         
         edge_logits = []
@@ -171,12 +182,15 @@ class EnhancedEdgeScorer(nn.Module):
             else:
                 # For negative/candidate edges, compute distance
                 temporal_feat = 0.0
-                try:
-                    hop_dist = float(nx.shortest_path_length(G_sub, u, v))
-                except:
-                    hop_dist = 10.0  # Disconnected
+                if self.fast_mode or self.skip_hopdist:
+                    hop_dist = 2.0  # constant to avoid nx.shortest_path_length overhead
+                else:
+                    try:
+                        hop_dist = float(nx.shortest_path_length(G_sub, u, v))
+                    except:
+                        hop_dist = 10.0  # Disconnected
             
-            edge_feats = torch.FloatTensor([temporal_feat, hop_dist])
+            edge_feats = torch.FloatTensor([temporal_feat, hop_dist]).to(device)
             concat = torch.cat([u_emb, v_emb, edge_feats], dim=0)
             logit = self.edge_mlp(concat).squeeze(-1)
             edge_logits.append(logit)
@@ -184,7 +198,7 @@ class EnhancedEdgeScorer(nn.Module):
         return torch.stack(edge_logits)
 
 
-def build_enhanced_model(G: nx.Graph, hidden_dim: int = 128, num_layers: int = 3) -> EnhancedEdgeScorer:
+def build_enhanced_model(G: nx.Graph, hidden_dim: int = 128, num_layers: int = 3, fast_mode: bool = False, skip_hopdist: bool = False) -> EnhancedEdgeScorer:
     """Build an enhanced scorer from a graph (infer node types and categorical attributes)."""
     node_types_set = set()
     cat_attrs: Dict[str, set] = {}
@@ -200,5 +214,8 @@ def build_enhanced_model(G: nx.Graph, hidden_dim: int = 128, num_layers: int = 3
     node_types = sorted(node_types_set)
     categorical_attrs = {k: sorted(v) for k, v in cat_attrs.items()}
     
-    return EnhancedEdgeScorer(node_types, categorical_attrs, hidden_dim=hidden_dim, num_layers=num_layers)
+    model = EnhancedEdgeScorer(node_types, categorical_attrs, hidden_dim=hidden_dim, num_layers=num_layers)
+    model.fast_mode = fast_mode
+    model.skip_hopdist = skip_hopdist
+    return model
 

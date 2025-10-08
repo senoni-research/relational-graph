@@ -50,7 +50,8 @@ class SimpleEdgeScorer(nn.Module):
             idx = self.type_to_idx.get(ntype, 0)
             type_indices.append(idx)
         
-        type_tensor = torch.LongTensor(type_indices)
+        device = next(self.parameters()).device
+        type_tensor = torch.LongTensor(type_indices).to(device)
         x = self.type_embed(type_tensor)  # (num_nodes, hidden_dim)
         
         # Simple GNN: aggregate neighbor embeddings

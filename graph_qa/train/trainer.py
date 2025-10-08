@@ -9,6 +9,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import networkx as nx
+import concurrent.futures
+import os
+from datetime import datetime
 
 from graph_qa.io.loader import load_graph
 from graph_qa.train.dataset import build_edge_dataset
@@ -38,6 +41,22 @@ def sample_subgraph_for_edge(G: nx.Graph, edge: Edge, hops: int = 2, K: int = 15
     return sub
 
 
+# Multiprocessing helpers (parallel subgraph sampling)
+_WORKER_G = None
+_WORKER_HOPS = 2
+_WORKER_K = 150
+
+def _init_worker(G: nx.Graph, hops: int, K: int):
+    global _WORKER_G, _WORKER_HOPS, _WORKER_K
+    _WORKER_G = G
+    _WORKER_HOPS = hops
+    _WORKER_K = K
+
+def _worker_sample(edge: Edge) -> nx.Graph:
+    # Uses globals set in _init_worker; returns a small subgraph
+    return sample_subgraph_for_edge(_WORKER_G, edge, hops=_WORKER_HOPS, K=_WORKER_K)
+
+
 def train_epoch(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -47,6 +66,8 @@ def train_epoch(
     hops: int = 2,
     K: int = 150,
     device: str = "cpu",
+    log_interval: int = 100,
+    num_workers: int = 0,
 ) -> float:
     """Train for one epoch; return average loss."""
     model.train()
@@ -54,17 +75,32 @@ def train_epoch(
     total_loss = 0.0
     num_batches = 0
 
-    for i in range(0, len(train_data), batch_size):
-        batch = train_data[i : i + batch_size]
-        batch_edges = [e for e, _ in batch]
-        batch_labels = torch.FloatTensor([lbl for _, lbl in batch]).to(device)
+    total_batches = (len(train_data) + batch_size - 1) // batch_size
+    
+    # Create a persistent executor per epoch to avoid per-batch startup overhead
+    executor: concurrent.futures.ProcessPoolExecutor | None = None
+    if num_workers and num_workers > 0:
+        executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=num_workers, initializer=_init_worker, initargs=(G, hops, K)
+        )
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Parallel sampling enabled with {num_workers} workers")
 
-        # Sample subgraphs and predict
-        logits_list = []
-        for edge in batch_edges:
-            sub = sample_subgraph_for_edge(G, edge, hops=hops, K=K)
-            logits = model(sub, [edge])  # (1,)
-            logits_list.append(logits[0])
+    try:
+        for i in range(0, len(train_data), batch_size):
+            batch = train_data[i : i + batch_size]
+            batch_edges = [e for e, _ in batch]
+            batch_labels = torch.FloatTensor([lbl for _, lbl in batch]).to(device)
+
+            # Sample subgraphs and predict
+            logits_list = []
+            if executor is not None:
+                subs = list(executor.map(_worker_sample, batch_edges))
+            else:
+                subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
+
+            for edge, sub in zip(batch_edges, subs):
+                logits = model(sub, [edge])  # (1,)
+                logits_list.append(logits[0])
         
         logits = torch.stack(logits_list)
         loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_labels)
@@ -75,6 +111,16 @@ def train_epoch(
 
         total_loss += loss.item()
         num_batches += 1
+        
+        # Progress reporting
+        if num_batches % max(1, log_interval) == 0 or num_batches == 1:
+            avg_loss = total_loss / num_batches
+            progress_pct = 100 * num_batches / total_batches
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch {num_batches}/{total_batches} ({progress_pct:.1f}%) - Avg Loss: {avg_loss:.4f}")
+
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     return total_loss / max(num_batches, 1)
 
@@ -87,6 +133,7 @@ def eval_epoch(
     hops: int = 2,
     K: int = 150,
     device: str = "cpu",
+    num_workers: int = 0,
 ) -> Tuple[float, float]:
     """Evaluate on val; return (loss, accuracy)."""
     model.eval()
@@ -95,16 +142,25 @@ def eval_epoch(
     total = 0
 
     with torch.no_grad():
-        for i in range(0, len(val_data), batch_size):
-            batch = val_data[i : i + batch_size]
-            batch_edges = [e for e, _ in batch]
-            batch_labels = torch.FloatTensor([lbl for _, lbl in batch]).to(device)
+        executor: concurrent.futures.ProcessPoolExecutor | None = None
+        if num_workers and num_workers > 0:
+            executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=num_workers, initializer=_init_worker, initargs=(G, hops, K)
+            )
+        try:
+            for i in range(0, len(val_data), batch_size):
+                batch = val_data[i : i + batch_size]
+                batch_edges = [e for e, _ in batch]
+                batch_labels = torch.FloatTensor([lbl for _, lbl in batch]).to(device)
 
-            logits_list = []
-            for edge in batch_edges:
-                sub = sample_subgraph_for_edge(G, edge, hops=hops, K=K)
-                logits = model(sub, [edge])
-                logits_list.append(logits[0])
+                logits_list = []
+                if executor is not None:
+                    subs = list(executor.map(_worker_sample, batch_edges))
+                else:
+                    subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
+                for edge, sub in zip(batch_edges, subs):
+                    logits = model(sub, [edge])
+                    logits_list.append(logits[0])
             
             logits = torch.stack(logits_list)
             loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_labels)
@@ -113,6 +169,10 @@ def eval_epoch(
             preds = (torch.sigmoid(logits) > 0.5).float()
             correct += (preds == batch_labels).sum().item()
             total += len(batch_labels)
+
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
     avg_loss = total_loss / max(len(val_data) // batch_size, 1)
     accuracy = correct / max(total, 1)
@@ -134,6 +194,10 @@ def main():
     parser.add_argument("--out", type=str, default="checkpoints/edge_scorer.pt", help="Output checkpoint path")
     parser.add_argument("--patience", type=int, default=3, help="Early stopping patience")
     parser.add_argument("--use-enhanced", action="store_true", help="Use enhanced model with rich features")
+    parser.add_argument("--fast-mode", action="store_true", help="Fast mode: skip attention and hop distance")
+    parser.add_argument("--skip-hopdist", action="store_true", help="Skip hop-distance computation only (keep attention)")
+    parser.add_argument("--log-interval", type=int, default=100, help="Batches between progress logs")
+    parser.add_argument("--num-workers", type=int, default=0, help="Parallel workers for subgraph sampling (0=off)")
     args = parser.parse_args()
 
     print(f"Loading graph from {args.graph}...")
@@ -146,10 +210,10 @@ def main():
     )
     print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
 
-    # Select device (MPS > CPU)
-    if torch.backends.mps.is_available():
+    # Prefer MPS on Apple Silicon if available; fallback to CPU
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
-        print("  → Using MPS (Apple Silicon GPU)")
+        print("  → Using MPS")
     else:
         device = torch.device("cpu")
         print("  → Using CPU")
@@ -157,7 +221,7 @@ def main():
     print("Building model...")
     if args.use_enhanced:
         print("  → Using enhanced model with attention and rich features")
-        model = build_enhanced_model(G, hidden_dim=args.hidden_dim, num_layers=args.num_layers)
+        model = build_enhanced_model(G, hidden_dim=args.hidden_dim, num_layers=args.num_layers, fast_mode=args.fast_mode, skip_hopdist=args.skip_hopdist)
     else:
         print("  → Using simple baseline model")
         model = build_model(G, hidden_dim=args.hidden_dim, num_layers=args.num_layers)
@@ -169,10 +233,11 @@ def main():
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Epoch {epoch}/{args.epochs} starting ...")
         train_loss = train_epoch(
-            model, optimizer, G, train_data, batch_size=args.batch_size, hops=args.hops, K=args.K, device=device
+            model, optimizer, G, train_data, batch_size=args.batch_size, hops=args.hops, K=args.K, device=str(device), log_interval=args.log_interval, num_workers=args.num_workers
         )
-        val_loss, val_acc = eval_epoch(model, G, val_data, batch_size=args.batch_size * 2, hops=args.hops, K=args.K, device=device)
+        val_loss, val_acc = eval_epoch(model, G, val_data, batch_size=args.batch_size * 2, hops=args.hops, K=args.K, device=str(device), num_workers=max(1, args.num_workers // 2))
         print(f"Epoch {epoch}/{args.epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
 
         if val_loss < best_val_loss:
@@ -184,6 +249,7 @@ def main():
                 {
                     "model_state": model.state_dict(),
                     "node_types": model.node_types,
+                    "categorical_attrs": getattr(model, "categorical_attrs", None),
                     "hidden_dim": args.hidden_dim,
                     "num_layers": args.num_layers,
                 },
