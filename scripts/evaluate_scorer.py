@@ -59,6 +59,11 @@ def evaluate_scorer(
             hidden_dim=ckpt["hidden_dim"],
             num_layers=ckpt["num_layers"],
         )
+        # Align runtime flags with training if present
+        if "fast_mode" in ckpt:
+            model.fast_mode = bool(ckpt["fast_mode"])  # type: ignore
+        if "skip_hopdist" in ckpt:
+            model.skip_hopdist = bool(ckpt["skip_hopdist"])  # type: ignore
     else:
         print("  → Detected simple baseline model")
         model = SimpleEdgeScorer(
@@ -70,9 +75,14 @@ def evaluate_scorer(
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
+    # Use training hparams if provided
+    hops = ckpt.get("hops", hops)
+    K = ckpt.get("K", K)
+
     print("Evaluating on test set...")
     preds = []
     labels = []
+    empty_subgraphs = 0
 
     with torch.no_grad():
         for i, (edge, label) in enumerate(test_data):
@@ -80,22 +90,29 @@ def evaluate_scorer(
                 print(f"  {i}/{len(test_data)}", end="\r")
             
             sub = sample_subgraph_for_edge(G, edge, hops=hops, K=K)
-            if sub.number_of_edges() == 0:
-                # Empty subgraph; skip or use prior
-                logit = torch.tensor([0.0])
+            # Model takes (u,v); drop t if present
+            if isinstance(edge, (tuple, list)) and len(edge) == 3:
+                ev = (edge[0], edge[1])
             else:
-                # Model takes (u,v); drop t if present
-                if isinstance(edge, (tuple, list)) and len(edge) == 3:
-                    ev = (edge[0], edge[1])
-                else:
-                    ev = edge
-                logit = model(sub, [ev])
+                ev = edge
+            # If empty, still score endpoints using node attrs only
+            if sub.number_of_edges() == 0:
+                empty_subgraphs += 1
+            if sub.number_of_edges() == 0 and len(sub) == 0:
+                import networkx as nx  # local import to avoid global dep
+                sub = nx.Graph()
+                if G.has_node(ev[0]):
+                    sub.add_node(ev[0], **G.nodes[ev[0]])
+                if G.has_node(ev[1]):
+                    sub.add_node(ev[1], **G.nodes[ev[1]])
+            logit = model(sub, [ev])
             
             prob = torch.sigmoid(logit).item()
             preds.append(prob)
             labels.append(label)
 
     print("\nTest Results:")
+    print(f"  Empty subgraphs: {empty_subgraphs} / {len(test_data)} ({100.0*empty_subgraphs/len(test_data):.1f}%)")
     auc = roc_auc_score(labels, preds)
     ap = average_precision_score(labels, preds)
     print(f"  AUC: {auc:.4f}")

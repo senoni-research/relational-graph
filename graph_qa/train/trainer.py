@@ -111,22 +111,22 @@ def train_epoch(
                     ev = edge
                 logits = model(sub, [ev])  # (1,)
                 logits_list.append(logits[0])
-        
-        logits = torch.stack(logits_list)
-        loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_labels)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            logits = torch.stack(logits_list)
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_labels)
 
-        total_loss += loss.item()
-        num_batches += 1
-        
-        # Progress reporting
-        if num_batches % max(1, log_interval) == 0 or num_batches == 1:
-            avg_loss = total_loss / num_batches
-            progress_pct = 100 * num_batches / total_batches
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch {num_batches}/{total_batches} ({progress_pct:.1f}%) - Avg Loss: {avg_loss:.4f}")
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+            
+            # Progress reporting
+            if num_batches % max(1, log_interval) == 0 or num_batches == 1:
+                avg_loss = total_loss / num_batches
+                progress_pct = 100 * num_batches / total_batches
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch {num_batches}/{total_batches} ({progress_pct:.1f}%) - Avg Loss: {avg_loss:.4f}")
 
     finally:
         if executor is not None:
@@ -157,6 +157,7 @@ def eval_epoch(
             executor = concurrent.futures.ProcessPoolExecutor(
                 max_workers=num_workers, initializer=_init_worker, initargs=(G, hops, K)
             )
+        num_batches = 0
         try:
             for i in range(0, len(val_data), batch_size):
                 batch = val_data[i : i + batch_size]
@@ -175,20 +176,21 @@ def eval_epoch(
                         ev = edge
                     logits = model(sub, [ev])
                     logits_list.append(logits[0])
-            
-            logits = torch.stack(logits_list)
-            loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_labels)
-            total_loss += loss.item()
 
-            preds = (torch.sigmoid(logits) > 0.5).float()
-            correct += (preds == batch_labels).sum().item()
-            total += len(batch_labels)
+                logits = torch.stack(logits_list)
+                loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_labels)
+                total_loss += loss.item()
+                num_batches += 1
+
+                preds = (torch.sigmoid(logits) > 0.5).float()
+                correct += (preds == batch_labels).sum().item()
+                total += len(batch_labels)
 
         finally:
             if executor is not None:
                 executor.shutdown(wait=True)
 
-    avg_loss = total_loss / max(len(val_data) // batch_size, 1)
+    avg_loss = total_loss / max(num_batches, 1)
     accuracy = correct / max(total, 1)
     return avg_loss, accuracy
 
@@ -257,7 +259,7 @@ def main():
         train_loss = train_epoch(
             model, optimizer, G, train_data, batch_size=args.batch_size, hops=args.hops, K=args.K, device=str(device), log_interval=args.log_interval, num_workers=args.num_workers
         )
-        val_loss, val_acc = eval_epoch(model, G, val_data, batch_size=args.batch_size * 2, hops=args.hops, K=args.K, device=str(device), num_workers=max(1, args.num_workers // 2))
+        val_loss, val_acc = eval_epoch(model, G, val_data, batch_size=args.batch_size * 2, hops=args.hops, K=args.K, device=str(device), num_workers=max(0, args.num_workers // 2))
         print(f"Epoch {epoch}/{args.epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
 
         if val_loss < best_val_loss:
@@ -272,6 +274,10 @@ def main():
                     "categorical_attrs": getattr(model, "categorical_attrs", None),
                     "hidden_dim": args.hidden_dim,
                     "num_layers": args.num_layers,
+                    "hops": args.hops,
+                    "K": args.K,
+                    "fast_mode": args.fast_mode,
+                    "skip_hopdist": args.skip_hopdist,
                 },
                 out_path,
             )
