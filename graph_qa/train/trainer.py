@@ -150,6 +150,8 @@ def eval_epoch(
     total_loss = 0.0
     correct = 0
     total = 0
+    all_probs = []
+    all_labels = []
 
     with torch.no_grad():
         executor: concurrent.futures.ProcessPoolExecutor | None = None
@@ -182,9 +184,12 @@ def eval_epoch(
                 total_loss += loss.item()
                 num_batches += 1
 
-                preds = (torch.sigmoid(logits) > 0.5).float()
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).float()
                 correct += (preds == batch_labels).sum().item()
                 total += len(batch_labels)
+                all_probs.append(probs.cpu())
+                all_labels.append(batch_labels.cpu())
 
         finally:
             if executor is not None:
@@ -192,6 +197,18 @@ def eval_epoch(
 
     avg_loss = total_loss / max(num_batches, 1)
     accuracy = correct / max(total, 1)
+    # Optional: print AUC/AP if sklearn is available and we have data
+    try:
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        if all_probs and all_labels:
+            import torch as _torch
+            probs_cat = _torch.cat(all_probs).numpy()
+            labels_cat = _torch.cat(all_labels).numpy()
+            val_auc = roc_auc_score(labels_cat, probs_cat)
+            val_ap = average_precision_score(labels_cat, probs_cat)
+            print(f"  Val AUC: {val_auc:.4f}, Val AP: {val_ap:.4f}")
+    except Exception:
+        pass
     return avg_loss, accuracy
 
 

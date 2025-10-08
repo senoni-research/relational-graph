@@ -73,8 +73,8 @@ def sample_temporal_egonet(
         for nbr in G.neighbors(node):
             if nbr not in allowed_nodes:
                 continue
-            # Only traverse edges with time <= anchor_time
-            if _edge_time(G, node, nbr) > anchor_time:
+            # Only traverse edges with time < anchor_time (strictly before t)
+            if _edge_time(G, node, nbr) >= anchor_time:
                 continue
             if nbr not in visited:
                 visited.add(nbr)
@@ -88,7 +88,7 @@ def sample_temporal_egonet(
 
     for u in H.nodes:
         for v in G.neighbors(u):
-            if v in H and _edge_time(G, u, v) <= anchor_time:
+            if v in H and _edge_time(G, u, v) < anchor_time:
                 # For MultiGraph, copy the earliest edge; for Graph, copy the single edge
                 if isinstance(G, nx.MultiGraph):
                     # Find earliest edge key
