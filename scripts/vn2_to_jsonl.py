@@ -35,6 +35,8 @@ def build_graph_records(
     max_pairs: int | None = 1000,
     start_date: str | None = None,
     end_date: str | None = None,
+    include_sold_zeros: bool = False,
+    sold_zeros_if_instock: bool = True,
 ) -> List[dict]:
     sales = pd.read_csv(sales_path)
     instock = pd.read_csv(stock_path)
@@ -58,12 +60,22 @@ def build_graph_records(
         instock = instock[instock.apply(lambda r: (r["Store"], r["Product"]) in head_pairs, axis=1)]
         master = master[master.apply(lambda r: (r["Store"], r["Product"]) in head_pairs, axis=1)]
 
-    # Collect node ids
+    # Helper to canonicalize IDs like "0.0" -> 0
+    def canon_num(x: object) -> object:
+        try:
+            s = str(x)
+            if s.replace('.', '', 1).isdigit():
+                return int(float(s))
+        except Exception:
+            pass
+        return x
+
+    # Collect node ids (canonicalized)
     stores: Set[str] = set()
     products: Set[str] = set()
     for _, r in sales.iterrows():
-        stores.add(f"store:{r['Store']}")
-        products.add(f"product:{r['Product']}")
+        stores.add(f"store:{canon_num(r['Store'])}")
+        products.add(f"product:{canon_num(r['Product'])}")
 
     # Build node records (store/product). Attach product taxonomy and store format from master
     product_attr_cols = [c for c in master.columns if c not in ("Store", "Product")]
@@ -115,10 +127,24 @@ def build_graph_records(
                     attrs[col] = int(val) if isinstance(val, (int, float)) else val
         records.append({"type": "node", "id": pid, "attrs": attrs})
 
-    # Edges: sold (create edge for ALL weeks, including zero sales for temporal history)
+    # Prepare inventory-present keys for conditional zero-sales retention
+    instock_bool = instock.copy()
+    # Coerce to booleans if needed
+    for d in stock_dates:
+        if instock_bool[d].dtype != bool:
+            instock_bool[d] = instock_bool[d].astype(str).str.lower().isin(["true", "1", "yes"])
+    inv_present_keys: Set[tuple] = set()
+    for _, r in instock_bool.iterrows():
+        s = canon_num(r['Store'])
+        p = canon_num(r['Product'])
+        for d in stock_dates:
+            if bool(r[d]):
+                inv_present_keys.add((s, p, ymd_to_int(d)))
+
+    # Edges: sold events (by default drop zero-sales; optionally keep when inventory is present)
     for _, r in sales.iterrows():
-        u = f"store:{r['Store']}"
-        v = f"product:{r['Product']}"
+        u = f"store:{canon_num(r['Store'])}"
+        v = f"product:{canon_num(r['Product'])}"
         for d in sales_dates:
             val = r[d]
             try:
@@ -126,7 +152,15 @@ def build_graph_records(
             except Exception:
                 continue
             if pd.notna(units):
-                # Create edge even if units=0 to capture full temporal history
+                if units == 0.0 and not include_sold_zeros:
+                    # Keep zero-sales only if inventory is present at that week and policy allows
+                    if not sold_zeros_if_instock:
+                        continue
+                    s_key = canon_num(r['Store'])
+                    p_key = canon_num(r['Product'])
+                    t_key = ymd_to_int(d)
+                    if (s_key, p_key, t_key) not in inv_present_keys:
+                        continue
                 records.append(
                     {
                         "type": "edge",
@@ -137,15 +171,9 @@ def build_graph_records(
                 )
 
     # Edges: has_inventory (boolean True)
-    # Coerce to booleans if needed
-    instock_bool = instock.copy()
-    for d in stock_dates:
-        if instock_bool[d].dtype != bool:
-            instock_bool[d] = instock_bool[d].astype(str).str.lower().isin(["true", "1", "yes"])
-
     for _, r in instock_bool.iterrows():
-        u = f"store:{r['Store']}"
-        v = f"product:{r['Product']}"
+        u = f"store:{canon_num(r['Store'])}"
+        v = f"product:{canon_num(r['Product'])}"
         for d in stock_dates:
             present = bool(r[d])
             if present:
@@ -168,6 +196,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-pairs", type=int, default=200, help="Limit number of (Store,Product) pairs")
     ap.add_argument("--start-date", type=str, default=None, help="Inclusive YYYY-MM-DD filter")
     ap.add_argument("--end-date", type=str, default=None, help="Inclusive YYYY-MM-DD filter")
+    ap.add_argument("--include-sold-zeros", action="store_true", help="Keep zero-sales 'sold' edges regardless of inventory (default off)")
+    # Default: keep zero-sales only when inventory is present; allow disabling
+    ap.add_argument("--sold-zeros-if-instock", dest="sold_zeros_if_instock", action="store_true")
+    ap.add_argument("--no-sold-zeros-if-instock", dest="sold_zeros_if_instock", action="store_false")
+    ap.set_defaults(sold_zeros_if_instock=True)
     return ap.parse_args()
 
 
@@ -188,6 +221,8 @@ def main() -> None:
         max_pairs=args.max_pairs,
         start_date=args.start_date,
         end_date=args.end_date,
+        include_sold_zeros=args.include_sold_zeros,
+        sold_zeros_if_instock=args.sold_zeros_if_instock,
     )
     out_path = Path(args.out)
     write_jsonl(records, out_path)

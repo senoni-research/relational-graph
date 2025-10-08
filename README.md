@@ -49,36 +49,60 @@ relational-graph ask --graph graph_qa/data/vn2_graph_sample.jsonl --question "Wh
 ```bash
 python scripts/vn2_to_jsonl.py \
   --vn2-data-dir ../vn2inventory/data \
-  --out graph_qa/data/vn2_graph_full.jsonl \
-  --max-pairs 0  # 0 = all pairs
+  --out graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --max-pairs 0 \
+  # Zero-sales policy:
+  # (default) keep zeros only when inventory is present
+  # To drop all zeros: --no-sold-zeros-if-instock
+  # To keep all zeros regardless of inventory: --include-sold-zeros
 ```
 
 2) Train edge scorer (masked-edge objective)
 ```bash
 relational-graph train-scorer \
-  --graph graph_qa/data/vn2_graph_full.jsonl \
-  --train-end 2024-01-31 \
-  --val-end 2024-03-15 \
+  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --train-end 2023-06-30 \
+  --val-end 2023-12-31 \
   --epochs 10 \
   --batch-size 32 \
   --out checkpoints/vn2_scorer.pt
 ```
 This learns p(edge | graph context) on temporal train split; validates on held-out weeks.
 
-3) Evaluate on test set
+3) Enhanced/time-aware training (recommended)
+```bash
+relational-graph train-scorer \
+  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --train-end 2023-06-30 \
+  --val-end 2023-12-31 \
+  --epochs 15 \
+  --batch-size 512 \
+  --hidden-dim 32 \
+  --num-layers 2 \
+  --K 30 \
+  --hops 1 \
+  --use-enhanced \
+  --time-aware \
+  --out checkpoints/vn2_temporal_scorer.pt
+```
+
+4) Evaluate on test set
 ```bash
 python scripts/evaluate_scorer.py \
-  --graph graph_qa/data/vn2_graph_full.jsonl \
-  --ckpt checkpoints/vn2_scorer.pt
+  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --ckpt checkpoints/vn2_temporal_scorer.pt \
+  --train-end 2023-06-30 \
+  --val-end 2023-12-31 \
+  --time-aware
 ```
-Reports AUC/AP on edges after 2024-03-15 (temporal test split).
+Reports AUC/AP on temporally held-out (u,v,t) samples.
 
-4) Query with learned probabilities
+5) Query with learned probabilities
 ```bash
 relational-graph predict-subgraph \
-  --graph graph_qa/data/vn2_graph_full.jsonl \
+  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
   --a store:5 --b product:124 \
-  --scorer-ckpt checkpoints/vn2_scorer.pt
+  --scorer-ckpt checkpoints/vn2_temporal_scorer.pt
 ```
 Returns edges with learned p(e); paths ranked by cost = −log p(e).
 

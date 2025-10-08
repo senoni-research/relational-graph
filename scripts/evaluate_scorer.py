@@ -8,7 +8,7 @@ import torch
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 from graph_qa.io.loader import load_graph
-from graph_qa.train.dataset import build_edge_dataset
+from graph_qa.train.dataset import build_edge_dataset, build_time_aware_dataset
 from graph_qa.train.model import SimpleEdgeScorer
 from graph_qa.train.model_v2 import EnhancedEdgeScorer
 from graph_qa.train.trainer import sample_subgraph_for_edge
@@ -21,13 +21,17 @@ def evaluate_scorer(
     val_end: str = "2024-03-15",
     hops: int = 2,
     K: int = 150,
+    time_aware: bool = False,
 ):
     print(f"Loading graph from {graph_path}...")
     G = load_graph(graph_path, multi=True)
     print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
     print(f"Building test set (> {val_end})...")
-    _, _, test_data = build_edge_dataset(G, train_end, val_end, num_negatives=1)
+    if time_aware:
+        _, _, test_data = build_time_aware_dataset(G, train_end, val_end)
+    else:
+        _, _, test_data = build_edge_dataset(G, train_end, val_end, num_negatives=1)
     print(f"Test samples: {len(test_data)}")
 
     print(f"Loading model from {ckpt_path}...")
@@ -80,7 +84,12 @@ def evaluate_scorer(
                 # Empty subgraph; skip or use prior
                 logit = torch.tensor([0.0])
             else:
-                logit = model(sub, [edge])
+                # Model takes (u,v); drop t if present
+                if isinstance(edge, (tuple, list)) and len(edge) == 3:
+                    ev = (edge[0], edge[1])
+                else:
+                    ev = edge
+                logit = model(sub, [ev])
             
             prob = torch.sigmoid(logit).item()
             preds.append(prob)
@@ -108,6 +117,7 @@ def main():
     parser.add_argument("--val-end", type=str, default="2024-03-15")
     parser.add_argument("--hops", type=int, default=2)
     parser.add_argument("--K", type=int, default=150)
+    parser.add_argument("--time-aware", action="store_true")
     args = parser.parse_args()
 
     evaluate_scorer(
@@ -117,6 +127,7 @@ def main():
         val_end=args.val_end,
         hops=args.hops,
         K=args.K,
+        time_aware=args.time_aware,
     )
 
 

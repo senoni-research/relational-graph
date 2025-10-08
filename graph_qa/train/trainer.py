@@ -14,29 +14,34 @@ import os
 from datetime import datetime
 
 from graph_qa.io.loader import load_graph
-from graph_qa.train.dataset import build_edge_dataset
+from graph_qa.train.dataset import build_edge_dataset, build_time_aware_dataset
 from graph_qa.train.model import build_model
 from graph_qa.train.model_v2 import build_enhanced_model
 from graph_qa.sampling.temporal_egonet import sample_temporal_egonet
 
 
 Edge = Tuple[Any, Any]
+EdgeT = Tuple[Any, Any, int]
 
 
-def sample_subgraph_for_edge(G: nx.Graph, edge: Edge, hops: int = 2, K: int = 150) -> nx.Graph:
+def sample_subgraph_for_edge(G: nx.Graph, edge: Any, hops: int = 2, K: int = 150) -> nx.Graph:
     """Sample a temporal egonet around an edge for training."""
-    u, v = edge
+    # Support (u, v) or (u, v, t)
+    if isinstance(edge, (tuple, list)) and len(edge) == 3:
+        u, v, t = edge  # type: ignore
+        anchor_time = t
+    else:
+        u, v = edge  # type: ignore
+        t = None
+        anchor_time = None
     anchors = [u, v]
-    # Use the edge's time if available (get latest time for MultiGraph)
-    if G.has_edge(u, v):
+    # If time not provided, fallback to edge-derived time
+    if anchor_time is None and G.has_edge(u, v):
         if isinstance(G, nx.MultiGraph):
-            # Get max time across all parallel edges
             times = [G[u][v][key].get("time", None) for key in G[u][v]]
             anchor_time = max(t for t in times if t is not None) if any(t is not None for t in times) else None
         else:
             anchor_time = G.edges[u, v].get("time", None)
-    else:
-        anchor_time = None
     sub = sample_temporal_egonet(G, anchors, hops=hops, K=K, anchor_time=anchor_time)
     return sub
 
@@ -99,7 +104,12 @@ def train_epoch(
                 subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
 
             for edge, sub in zip(batch_edges, subs):
-                logits = model(sub, [edge])  # (1,)
+                # Model expects (u, v) pairs; drop t if present
+                if isinstance(edge, (tuple, list)) and len(edge) == 3:
+                    ev = (edge[0], edge[1])
+                else:
+                    ev = edge
+                logits = model(sub, [ev])  # (1,)
                 logits_list.append(logits[0])
         
         logits = torch.stack(logits_list)
@@ -159,7 +169,11 @@ def eval_epoch(
                 else:
                     subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
                 for edge, sub in zip(batch_edges, subs):
-                    logits = model(sub, [edge])
+                    if isinstance(edge, (tuple, list)) and len(edge) == 3:
+                        ev = (edge[0], edge[1])
+                    else:
+                        ev = edge
+                    logits = model(sub, [ev])
                     logits_list.append(logits[0])
             
             logits = torch.stack(logits_list)
@@ -197,6 +211,7 @@ def main():
     parser.add_argument("--fast-mode", action="store_true", help="Fast mode: skip attention and hop distance")
     parser.add_argument("--skip-hopdist", action="store_true", help="Skip hop-distance computation only (keep attention)")
     parser.add_argument("--log-interval", type=int, default=100, help="Batches between progress logs")
+    parser.add_argument("--time-aware", action="store_true", help="Use time-aware dataset with (u,v,t) and true-zero negatives")
     parser.add_argument("--num-workers", type=int, default=0, help="Parallel workers for subgraph sampling (0=off)")
     args = parser.parse_args()
 
@@ -205,9 +220,14 @@ def main():
     print(f"Graph loaded: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges (temporal multi-edges)")
 
     print("Building train/val/test splits...")
-    train_data, val_data, test_data = build_edge_dataset(
-        G, train_end=args.train_end, val_end=args.val_end, num_negatives=1
-    )
+    if args.time_aware:
+        train_data, val_data, test_data = build_time_aware_dataset(
+            G, train_end=args.train_end, val_end=args.val_end
+        )
+    else:
+        train_data, val_data, test_data = build_edge_dataset(
+            G, train_end=args.train_end, val_end=args.val_end, num_negatives=1
+        )
     print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
 
     # Prefer MPS on Apple Silicon if available; fallback to CPU

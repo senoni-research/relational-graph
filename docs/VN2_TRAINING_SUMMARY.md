@@ -13,7 +13,7 @@ A learned edge scorer that predicts p(store, product) = probability of a meaning
 - **Results**: AUC 0.48, AP 0.72 on limited test set
 - **Issue**: NetworkX Graph de-duplicated temporal edges; tiny train set (8 edges)
 
-### Enhanced model v2 (MultiGraph, 182K temporal edges)
+### Enhanced model v2 (MultiGraph, ~172K temporal edges)
 - **Added features**:
   - **Product hierarchy**: ProductGroup, Division, Department, DepartmentGroup (categorical embeddings)
   - **Store attributes**: StoreFormat, Format
@@ -23,8 +23,8 @@ A learned edge scorer that predicts p(store, product) = probability of a meaning
   - Multi-head attention over neighbors (4 heads)
   - 3 layers, 128-dim hidden
   - Dropout 0.1 for regularization
-- **Data**: Full temporal MultiGraph preserving all 182K edges across 157 weeks (2021-2024)
-- **Training**: 257K samples (128K positive + 129K negative), temporal split
+- **Data**: Full temporal MultiGraph (~172K edges) across 157 weeks (2021–2024); keeps zero-sales only when inventory is present (normalized IDs)
+- **Training**: Time-aware samples with positives = sold>0 and negatives = (inventory present ∧ sold==0), temporal split. Example current run: Train 77,561 · Val 3,577 · Test 2,388 (samples)
 - **Results**: Training infrastructure complete and tested; full training requires GPU or overnight CPU run (~2-4 hours for 15 epochs on CPU; <30 min with GPU)
 
 ## How to use for VN2
@@ -47,7 +47,11 @@ Why keep both? The baseline provides a quick, deterministic check and a fallback
 python scripts/vn2_to_jsonl.py \
   --vn2-data-dir ../vn2inventory/data \
   --out graph_qa/data/vn2_graph_full_temporal.jsonl \
-  --max-pairs 0  # All 599 (store, product) pairs, all 157 weeks
+  --max-pairs 0 \
+  # Zero-sales policy:
+  # (default) keep zeros only when inventory is present
+  # To drop all zeros: --no-sold-zeros-if-instock
+  # To keep all zeros regardless of inventory: --include-sold-zeros
 ```
 
 ### 2. Train scorer (temporal)
@@ -80,9 +84,10 @@ relational-graph train-scorer \
   --K 30 \
   --hops 1 \
   --use-enhanced \
+  --time-aware \
   --out checkpoints/vn2_temporal_scorer.pt
 ```
-This trains on 257K samples (128K train edges + negatives) from 2021–2023.
+This trains on time-aware samples (u,v,t): positives sold>0, negatives inventory∧sold==0, using temporal splits.
 
 ### 3. Evaluate on test set
 ```bash
@@ -90,9 +95,10 @@ python scripts/evaluate_scorer.py \
   --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
   --ckpt checkpoints/vn2_temporal_scorer.pt \
   --train-end 2023-06-30 \
-  --val-end 2023-12-31
+  --val-end 2023-12-31 \
+  --time-aware
 ```
-Reports AUC/AP on 45K test edges (2024 data, temporally held-out).
+Reports AUC/AP on temporally held-out (u,v,t) samples in 2024.
 
 ### 4. Extract probabilities for VN2 ordering policy
 ```python
