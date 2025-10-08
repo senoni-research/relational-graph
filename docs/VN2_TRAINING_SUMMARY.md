@@ -21,10 +21,10 @@ A learned edge scorer that predicts p(store, product) = probability of a meaning
   - **Edge features**: temporal presence, units sold
 - **Architecture**:
   - Multi-head attention over neighbors (4 heads)
-  - 3 layers, 128-dim hidden
+  - 3 layers, 64–128-dim hidden (latest run: 64)
   - Dropout 0.1 for regularization
 - **Data**: Full temporal MultiGraph (~172K edges) across 157 weeks (2021–2024); keeps zero-sales only when inventory is present (normalized IDs)
-- **Training**: Time-aware samples with positives = sold>0 and negatives = (inventory present ∧ sold==0), temporal split. Example current run: Train 77,561 · Val 3,577 · Test 2,388 (samples)
+- **Training**: Time-aware samples with positives = sold>0 and negatives = (inventory present ∧ sold==0), temporal split. Latest run: Train 77,561 · Val 3,577 · Test 2,388 (samples)
 - **Results**: Training infrastructure complete and tested; full training requires GPU or overnight CPU run (~2-4 hours for 15 epochs on CPU; <30 min with GPU)
 
 ## How to use for VN2
@@ -75,17 +75,21 @@ Enhanced (recommended):
 ```bash
 relational-graph train-scorer \
   --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
-  --train-end 2023-06-30 \
-  --val-end 2023-12-31 \
-  --epochs 15 \
+  --train-end 2024-01-31 \
+  --val-end 2024-03-15 \
+  --epochs 10 \
   --batch-size 512 \
-  --hidden-dim 32 \
-  --num-layers 2 \
+  --hidden-dim 64 \
+  --num-layers 3 \
   --K 30 \
   --hops 1 \
   --use-enhanced \
+  --lr 0.001 \
+  --patience 3 \
+  --log-interval 25 \
+  --num-workers 14 \
   --time-aware \
-  --out checkpoints/vn2_temporal_scorer.pt
+  --out checkpoints/vn2_temporal_scorer_timeaware.pt
 ```
 This trains on time-aware samples (u,v,t): positives sold>0, negatives inventory∧sold==0, using temporal splits.
 
@@ -93,12 +97,17 @@ This trains on time-aware samples (u,v,t): positives sold>0, negatives inventory
 ```bash
 python scripts/evaluate_scorer.py \
   --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
-  --ckpt checkpoints/vn2_temporal_scorer.pt \
-  --train-end 2023-06-30 \
-  --val-end 2023-12-31 \
+  --ckpt checkpoints/vn2_temporal_scorer_timeaware.pt \
+  --train-end 2024-01-31 \
+  --val-end 2024-03-15 \
+  --hops 1 --K 30 \
   --time-aware
 ```
 Reports AUC/AP on temporally held-out (u,v,t) samples in 2024.
+
+Latest test results (time-aware, enhanced):
+- AUC: 0.4547
+- AP: 0.5230
 
 ### 4. Extract probabilities for VN2 ordering policy
 ```python
@@ -106,7 +115,7 @@ from graph_qa.io.loader import load_graph
 from graph_qa.scoring.learned_scorer import LearnedEdgeScorer
 
 G = load_graph("graph_qa/data/vn2_graph_full_temporal.jsonl", multi=True)
-scorer = LearnedEdgeScorer("checkpoints/vn2_temporal_scorer.pt")
+scorer = LearnedEdgeScorer("checkpoints/vn2_temporal_scorer_timeaware.pt")
 
 # Get edge probabilities for all (store, product) pairs
 for store_id in range(62):  # VN2 has stores 0-61
@@ -121,9 +130,9 @@ for store_id in range(62):  # VN2 has stores 0-61
 ## Temporal split (prevents leakage)
 
 **Full temporal graph** (all 157 weeks from 2021-04 to 2024-04):
-- **Train**: edges ≤ 2023-06-30 (~128K edges)
-- **Val**: 2023-07-01 to 2023-12-31 (~30K edges)
-- **Test**: > 2023-12-31 (~22K edges)
+- **Train**: edges ≤ 2024-01-31
+- **Val**: 2024-02-01 to 2024-03-15
+- **Test**: > 2024-03-15
 
 The loader uses `nx.MultiGraph()` to preserve all temporal edges (same (store, product) pair can have edges at multiple timestamps).
 
