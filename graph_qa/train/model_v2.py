@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Any, List, Tuple
 import math
+import datetime as _dt
 
 import torch
 import torch.nn as nn
@@ -169,6 +170,20 @@ class EnhancedEdgeScorer(nn.Module):
         node_to_idx = {n: i for i, n in enumerate(nodes)}
         
         edge_logits = []
+        
+        def _delta_in_weeks(t_new: int, t_old: int) -> int:
+            """Return non-negative difference in weeks between t_new and t_old.
+            Supports YYYYMMDD ints or week indices.
+            """
+            try:
+                if 19000101 <= t_new <= 21001231 and 19000101 <= t_old <= 21001231:
+                    y1, m1, d1 = t_new // 10000, (t_new % 10000) // 100, t_new % 100
+                    y0, m0, d0 = t_old // 10000, (t_old % 10000) // 100, t_old % 100
+                    days = max(0, (_dt.date(y1, m1, d1).toordinal() - _dt.date(y0, m0, d0).toordinal()))
+                    return days // 7
+                return max(0, int(t_new) - int(t_old))
+            except Exception:
+                return max(0, int(t_new) - int(t_old))
         for idx_edge, e in enumerate(edges):
             # Support (u, v) or (u, v, t_anchor)
             if isinstance(e, (tuple, list)) and len(e) == 3:
@@ -215,6 +230,16 @@ class EnhancedEdgeScorer(nn.Module):
 
             edge_feat_list = [temporal_feat, hop_dist]
             if self.recency_feature:
+                # Convert recency to weeks if timestamps are calendar dates
+                if t_anchor is not None and seen_before:
+                    # prev_ts were already filtered to < t_anchor above
+                    # Recompute weeks from the max previous timestamp to anchor
+                    try:
+                        weeks = _delta_in_weeks(int(t_anchor), int(max(prev_ts)) if 'prev_ts' in locals() and prev_ts else int(t_anchor))
+                    except Exception:
+                        weeks = 0
+                    denom = math.log1p(max(1.0, float(self.recency_norm)))
+                    recency_scalar = math.log1p(float(weeks)) / denom
                 edge_feat_list.append(recency_scalar)
             edge_feats = torch.tensor(edge_feat_list, dtype=torch.float32, device=device)
             concat = torch.cat([u_emb, v_emb, edge_feats], dim=0)
