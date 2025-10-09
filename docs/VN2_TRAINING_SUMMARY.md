@@ -110,6 +110,28 @@ Latest results (time-aware, enhanced + recency):
 - Val AUC: 0.6446, Val AP: 0.7609 (best epoch ~10)
 - Test AUC: 0.6444, Test AP: 0.7312 (Empty subgraphs: 0.0%)
 
+### 4. (Optional) Calibrate probabilities with isotonic regression
+
+Fit on the validation window and save the calibrator:
+```bash
+python -u scripts/calibrate_scorer.py \
+  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --ckpt checkpoints/vn2_temporal_scorer_timeaware_recency.pt \
+  --train-end 2024-01-31 --val-end 2024-03-15 \
+  --hops 1 --K 30 --time-aware \
+  --out checkpoints/calibrators/iso_val.pkl
+```
+
+Apply the calibrator at evaluation/inference time:
+```bash
+python -u scripts/evaluate_scorer.py \
+  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --ckpt checkpoints/vn2_temporal_scorer_timeaware_recency.pt \
+  --train-end 2024-01-31 --val-end 2024-03-15 \
+  --hops 1 --K 30 --time-aware \
+  --calibrator checkpoints/calibrators/iso_val.pkl
+```
+
 ### 4. Extract probabilities for VN2 ordering policy
 ```python
 from graph_qa.io.loader import load_graph
