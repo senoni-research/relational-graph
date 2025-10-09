@@ -2,6 +2,7 @@
 """Evaluate trained scorer on test set."""
 
 import argparse
+import pickle
 from pathlib import Path
 
 import torch
@@ -22,6 +23,7 @@ def evaluate_scorer(
     hops: int = 2,
     K: int = 150,
     time_aware: bool = False,
+    calibrator_path: str | None = None,
 ):
     print(f"Loading graph from {graph_path}...")
     G = load_graph(graph_path, multi=True)
@@ -113,6 +115,16 @@ def evaluate_scorer(
             preds.append(prob)
             labels.append(label)
 
+    # Apply optional calibrator
+    if calibrator_path:
+        try:
+            with open(calibrator_path, "rb") as f:
+                iso = pickle.load(f)
+            preds = list(map(float, iso.transform(preds)))
+            print(f"Applied calibrator: {calibrator_path}")
+        except Exception as e:
+            print(f"Warning: failed to load/apply calibrator {calibrator_path}: {e}")
+
     print("\nTest Results:")
     print(f"  Empty subgraphs: {empty_subgraphs} / {len(test_data)} ({100.0*empty_subgraphs/len(test_data):.1f}%)")
     auc = roc_auc_score(labels, preds)
@@ -137,6 +149,7 @@ def main():
     parser.add_argument("--hops", type=int, default=2)
     parser.add_argument("--K", type=int, default=150)
     parser.add_argument("--time-aware", action="store_true")
+    parser.add_argument("--calibrator", type=str, default=None, help="Path to a saved isotonic calibrator (pickle)")
     args = parser.parse_args()
 
     evaluate_scorer(
@@ -147,6 +160,7 @@ def main():
         hops=args.hops,
         K=args.K,
         time_aware=args.time_aware,
+        calibrator_path=args.calibrator,
     )
 
 
