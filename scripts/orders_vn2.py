@@ -145,6 +145,10 @@ def main():
     ap.add_argument("--hops", default=1, type=int)
     ap.add_argument("--K", default=30, type=int)
     ap.add_argument("--out", required=True, type=str)
+    ap.add_argument("--submission-index", default=None, type=str, help="599-row Store×Product index CSV (store_id,product_id) in platform order")
+    ap.add_argument("--state", default=None, type=str, help="CSV with columns store_id,product_id,onhand,onorder_le2")
+    ap.add_argument("--submit", default=None, type=str, help="If provided, write 599-row orders.csv here with order_qty column")
+    ap.add_argument("--beta", default=0.833, type=float, help="Critical fractile (default 1/(1+0.2))")
     args = ap.parse_args()
 
     print(f"Loading graph from {args.graph}...")
@@ -220,6 +224,107 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print("Done.")
+
+    # Optional: produce 599-row submission file in platform order
+    if args.submission_index and args.submit:
+        print(f"Producing submission from index {args.submission_index} -> {args.submit}")
+        # Load features into a lookup
+        feat_map: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for r in rows:
+            key = (str(r["store_id"]), str(r["product_id"]))
+            feat_map[key] = r
+
+        # Load state if provided
+        state_map: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        if args.state:
+            with open(args.state, "r") as sf:
+                sr = csv.DictReader(sf)
+                for srow in sr:
+                    key = (str(srow.get("store_id", "")), str(srow.get("product_id", "")))
+                    try:
+                        onhand = float(srow.get("onhand", 0) or 0)
+                        onorder = float(srow.get("onorder_le2", 0) or 0)
+                    except Exception:
+                        onhand, onorder = 0.0, 0.0
+                    state_map[key] = (onhand, onorder)
+
+        # Load index and compute orders
+        submissions: list[Dict[str, Any]] = []
+        with open(args.submission_index, "r") as idxf:
+            idxr = csv.DictReader(idxf)
+            for idxrow in idxr:
+                sid = str(idxrow.get("store_id", ""))
+                pid = str(idxrow.get("product_id", ""))
+                key = (sid, pid)
+                feat = feat_map.get(key)
+                if not feat:
+                    # Missing feature row: default to zero order
+                    mu_H = 0.0
+                    sigma_H = 0.0
+                else:
+                    mu_H = float(feat["mu_H"])  # horizon mean
+                    sigma_H = float(feat["sigma_H"])  # horizon std
+                # Critical fractile to z (approx without scipy)
+                # For beta=0.833, z ≈ 0.967. For general beta, use probit approximation.
+                beta = max(1e-6, min(1 - 1e-6, float(args.beta)))
+                # Abramowitz-Stegun approximation for inverse normal CDF
+                def inv_norm_cdf(p: float) -> float:
+                    # Source: Wichura algorithm approximation (simplified)
+                    # Good enough for beta near 0.8–0.9
+                    a1 = -39.69683028665376
+                    a2 = 220.9460984245205
+                    a3 = -275.9285104469687
+                    a4 = 138.3577518672690
+                    a5 = -30.66479806614716
+                    a6 = 2.506628277459239
+                    b1 = -54.47609879822406
+                    b2 = 161.5858368580409
+                    b3 = -155.6989798598866
+                    b4 = 66.80131188771972
+                    b5 = -13.28068155288572
+                    c1 = -0.007784894002430293
+                    c2 = -0.3223964580411365
+                    c3 = -2.400758277161838
+                    c4 = -2.549732539343734
+                    c5 = 4.374664141464968
+                    c6 = 2.938163982698783
+                    d1 = 0.007784695709041462
+                    d2 = 0.3224671290700398
+                    d3 = 2.445134137142996
+                    d4 = 3.754408661907416
+                    plow = 0.02425
+                    phigh = 1 - plow
+                    if p < plow:
+                        q = math.sqrt(-2 * math.log(p))
+                        return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / (
+                            ((((d1 * q + d2) * q + d3) * q + d4) * q + 1)
+                        )
+                    if p > phigh:
+                        q = math.sqrt(-2 * math.log(1 - p))
+                        return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / (
+                            ((((d1 * q + d2) * q + d3) * q + d4) * q + 1)
+                        )
+                    q = p - 0.5
+                    r = q * q
+                    return (
+                        (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q
+                    ) / (
+                        (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1)
+                    )
+
+                z = inv_norm_cdf(beta)
+                S = mu_H + z * sigma_H
+                onhand, onorder = state_map.get(key, (0.0, 0.0))
+                IP = onhand + onorder
+                q = max(0.0, S - IP)
+                submissions.append({"store_id": sid, "product_id": pid, "order_qty": int(round(q))})
+
+        # Write submission
+        with open(args.submit, "w", newline="") as sf:
+            writer = csv.DictWriter(sf, fieldnames=["store_id", "product_id", "order_qty"])
+            writer.writeheader()
+            writer.writerows(submissions)
+        print(f"Wrote submission {args.submit} with {len(submissions)} rows.")
 
 
 if __name__ == "__main__":
