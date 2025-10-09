@@ -78,18 +78,19 @@ relational-graph train-scorer \
   --train-end 2024-01-31 \
   --val-end 2024-03-15 \
   --epochs 10 \
-  --batch-size 512 \
+  --batch-size 256 \
   --hidden-dim 64 \
   --num-layers 3 \
   --K 30 \
   --hops 1 \
   --use-enhanced \
+  --recency-feature --recency-norm 52 \
   --lr 0.001 \
   --patience 3 \
-  --log-interval 25 \
-  --num-workers 14 \
+  --log-interval 10 \
+  --num-workers 6 \
   --time-aware \
-  --out checkpoints/vn2_temporal_scorer_timeaware.pt
+  --out checkpoints/vn2_temporal_scorer_timeaware_recency.pt
 ```
 This trains on time-aware samples (u,v,t): positives sold>0, negatives inventory∧sold==0, using temporal splits.
 
@@ -97,7 +98,7 @@ This trains on time-aware samples (u,v,t): positives sold>0, negatives inventory
 ```bash
 python scripts/evaluate_scorer.py \
   --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
-  --ckpt checkpoints/vn2_temporal_scorer_timeaware.pt \
+  --ckpt checkpoints/vn2_temporal_scorer_timeaware_recency.pt \
   --train-end 2024-01-31 \
   --val-end 2024-03-15 \
   --hops 1 --K 30 \
@@ -105,9 +106,9 @@ python scripts/evaluate_scorer.py \
 ```
 Reports AUC/AP on temporally held-out (u,v,t) samples in 2024.
 
-Latest test results (time-aware, enhanced):
-- AUC: 0.4547
-- AP: 0.5230
+Latest results (time-aware, enhanced + recency):
+- Val AUC: 0.6446, Val AP: 0.7609 (best epoch ~10)
+- Test AUC: 0.6444, Test AP: 0.7312 (Empty subgraphs: 0.0%)
 
 ### 4. Extract probabilities for VN2 ordering policy
 ```python
