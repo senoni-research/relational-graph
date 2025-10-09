@@ -111,7 +111,9 @@ def evaluate_scorer(
                     sub.add_node(ev[1], **G.nodes[ev[1]])
             logit = model(sub, [ev])
             
-            prob = torch.sigmoid(logit).item()
+            # Store raw logit for potential calibrator consumption
+            raw_logit = float(logit.item())
+            prob = 1.0 / (1.0 + pow(2.718281828, -raw_logit))
             preds.append(prob)
             labels.append(label)
 
@@ -119,8 +121,28 @@ def evaluate_scorer(
     if calibrator_path:
         try:
             with open(calibrator_path, "rb") as f:
-                iso = pickle.load(f)
-            preds = list(map(float, iso.transform(preds)))
+                cal = pickle.load(f)
+            # Support legacy pickles (plain Isotonic) and new dict format
+            if isinstance(cal, dict) and "model" in cal:
+                model = cal["model"]
+                input_space = cal.get("input", "prob")
+                if input_space == "logit":
+                    # Recompute logits for transform
+                    # Since we only stored probs above, approximate logit
+                    import math
+                    logits_for_cal = [math.log(max(1e-6, p) / max(1e-6, 1 - p)) for p in preds]
+                    X = logits_for_cal
+                else:
+                    X = preds
+                if hasattr(model, "transform"):
+                    preds = list(map(float, model.transform(X)))
+                else:
+                    # Platt (LogisticRegression)
+                    import numpy as np
+                    probs_lr = model.predict_proba(np.array(X).reshape(-1, 1))[:, 1]
+                    preds = list(map(float, probs_lr))
+            else:
+                preds = list(map(float, cal.transform(preds)))
             print(f"Applied calibrator: {calibrator_path}")
         except Exception as e:
             print(f"Warning: failed to load/apply calibrator {calibrator_path}: {e}")

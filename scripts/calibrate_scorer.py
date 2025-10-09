@@ -18,6 +18,7 @@ from pathlib import Path
 
 import torch
 from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 
 from graph_qa.io.loader import load_graph
 from graph_qa.train.dataset import build_time_aware_dataset, build_edge_dataset
@@ -35,6 +36,8 @@ def main():
     p.add_argument("--hops", default=1, type=int)
     p.add_argument("--K", default=30, type=int)
     p.add_argument("--time-aware", action="store_true")
+    p.add_argument("--calibration-method", type=str, default="isotonic", choices=["isotonic", "platt"], help="Calibration method")
+    p.add_argument("--input-space", type=str, default="prob", choices=["prob", "logit"], help="Calibrator input space")
     p.add_argument("--out", required=True, type=str)
     args = p.parse_args()
 
@@ -69,6 +72,7 @@ def main():
 
     print("Scoring validation set...")
     probs = []
+    logits = []
     labels = []
     with torch.no_grad():
         for i, (edge, label) in enumerate(val_data):
@@ -81,16 +85,32 @@ def main():
                 ev = edge
             logit = model(sub, [ev]).squeeze(0)
             prob = torch.sigmoid(logit).item()
+            logits.append(float(logit.item()))
             probs.append(prob)
             labels.append(label)
 
-    print("\nFitting isotonic regression on validation logits...")
-    iso = IsotonicRegression(out_of_bounds="clip")
-    cal_probs = iso.fit_transform(probs, labels)
+    print("\nFitting calibrator on validation...")
+    model_obj = None
+    meta = {"method": args.calibration_method, "input": args.input_space}
+    if args.calibration_method == "isotonic":
+        iso = IsotonicRegression(out_of_bounds="clip")
+        xs = logits if args.input_space == "logit" else probs
+        _ = iso.fit_transform(xs, labels)
+        model_obj = iso
+    else:
+        # Platt scaling via logistic regression on chosen input space
+        xs = logits if args.input_space == "logit" else probs
+        import numpy as np
+        X = np.array(xs, dtype=float).reshape(-1, 1)
+        y = np.array(labels, dtype=int)
+        lr = LogisticRegression(solver="lbfgs")
+        lr.fit(X, y)
+        model_obj = lr
+
     Path(os.path.dirname(args.out)).mkdir(parents=True, exist_ok=True)
     with open(args.out, "wb") as f:
-        pickle.dump(iso, f)
-    print(f"Saved calibrator to {args.out}")
+        pickle.dump({"method": meta["method"], "input": meta["input"], "model": model_obj}, f)
+    print(f"Saved calibrator to {args.out} ({meta['method']}, input={meta['input']})")
 
 
 if __name__ == "__main__":
