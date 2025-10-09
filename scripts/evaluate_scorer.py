@@ -58,6 +58,8 @@ def evaluate_scorer(
             categorical_attrs=cat_attrs,
             hidden_dim=ckpt["hidden_dim"],
             num_layers=ckpt["num_layers"],
+            recency_feature=ckpt.get("recency_feature", False),
+            recency_norm=ckpt.get("recency_norm", 52.0),
         )
         # Align runtime flags with training if present
         if "fast_mode" in ckpt:
@@ -90,9 +92,9 @@ def evaluate_scorer(
                 print(f"  {i}/{len(test_data)}", end="\r")
             
             sub = sample_subgraph_for_edge(G, edge, hops=hops, K=K)
-            # Model takes (u,v); drop t if present
+            # Pass (u,v,t) when available to enable t-anchored temporal features
             if isinstance(edge, (tuple, list)) and len(edge) == 3:
-                ev = (edge[0], edge[1])
+                ev = (edge[0], edge[1], edge[2])
             else:
                 ev = edge
             # If empty, still score endpoints using node attrs only

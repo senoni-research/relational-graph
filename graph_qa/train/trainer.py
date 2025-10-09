@@ -73,6 +73,7 @@ def train_epoch(
     device: str = "cpu",
     log_interval: int = 100,
     num_workers: int = 0,
+    executor: concurrent.futures.ProcessPoolExecutor | None = None,
 ) -> float:
     """Train for one epoch; return average loss."""
     model.train()
@@ -82,14 +83,6 @@ def train_epoch(
 
     total_batches = (len(train_data) + batch_size - 1) // batch_size
     
-    # Create a persistent executor per epoch to avoid per-batch startup overhead
-    executor: concurrent.futures.ProcessPoolExecutor | None = None
-    if num_workers and num_workers > 0:
-        executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=num_workers, initializer=_init_worker, initargs=(G, hops, K)
-        )
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Parallel sampling enabled with {num_workers} workers")
-
     try:
         for i in range(0, len(train_data), batch_size):
             batch = train_data[i : i + batch_size]
@@ -99,7 +92,13 @@ def train_epoch(
             # Sample subgraphs and predict
             logits_list = []
             if executor is not None:
-                subs = list(executor.map(_worker_sample, batch_edges))
+                try:
+                    chunksize = max(1, len(batch_edges) // max(1, getattr(executor, "_max_workers", num_workers) * 4))
+                    subs = list(executor.map(_worker_sample, batch_edges, chunksize=chunksize))
+                except concurrent.futures.process.BrokenProcessPool:
+                    print("[warn] process pool broken; falling back to single-process sampling")
+                    executor = None
+                    subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
             else:
                 subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
 
@@ -109,6 +108,14 @@ def train_epoch(
                     ev = (edge[0], edge[1])
                 else:
                     ev = edge
+                # Ensure minimal graph on pathological empty sample
+                if sub.number_of_edges() == 0 and len(sub) == 0:
+                    H = nx.Graph()
+                    if G.has_node(ev[0]):
+                        H.add_node(ev[0], **G.nodes[ev[0]])
+                    if G.has_node(ev[1]):
+                        H.add_node(ev[1], **G.nodes[ev[1]])
+                    sub = H
                 logits = model(sub, [ev])  # (1,)
                 logits_list.append(logits[0])
 
@@ -129,8 +136,7 @@ def train_epoch(
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch {num_batches}/{total_batches} ({progress_pct:.1f}%) - Avg Loss: {avg_loss:.4f}")
 
     finally:
-        if executor is not None:
-            executor.shutdown(wait=True)
+        pass
 
     return total_loss / max(num_batches, 1)
 
@@ -144,6 +150,7 @@ def eval_epoch(
     K: int = 150,
     device: str = "cpu",
     num_workers: int = 0,
+    executor: concurrent.futures.ProcessPoolExecutor | None = None,
 ) -> Tuple[float, float]:
     """Evaluate on val; return (loss, accuracy)."""
     model.eval()
@@ -154,11 +161,6 @@ def eval_epoch(
     all_labels = []
 
     with torch.no_grad():
-        executor: concurrent.futures.ProcessPoolExecutor | None = None
-        if num_workers and num_workers > 0:
-            executor = concurrent.futures.ProcessPoolExecutor(
-                max_workers=num_workers, initializer=_init_worker, initargs=(G, hops, K)
-            )
         num_batches = 0
         try:
             for i in range(0, len(val_data), batch_size):
@@ -168,7 +170,13 @@ def eval_epoch(
 
                 logits_list = []
                 if executor is not None:
-                    subs = list(executor.map(_worker_sample, batch_edges))
+                    try:
+                        chunksize = max(1, len(batch_edges) // max(1, getattr(executor, "_max_workers", num_workers) * 4))
+                        subs = list(executor.map(_worker_sample, batch_edges, chunksize=chunksize))
+                    except concurrent.futures.process.BrokenProcessPool:
+                        print("[warn] process pool broken during eval; falling back to single-process sampling")
+                        executor = None
+                        subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
                 else:
                     subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
                 for edge, sub in zip(batch_edges, subs):
@@ -176,6 +184,13 @@ def eval_epoch(
                         ev = (edge[0], edge[1])
                     else:
                         ev = edge
+                    if sub.number_of_edges() == 0 and len(sub) == 0:
+                        H = nx.Graph()
+                        if G.has_node(ev[0]):
+                            H.add_node(ev[0], **G.nodes[ev[0]])
+                        if G.has_node(ev[1]):
+                            H.add_node(ev[1], **G.nodes[ev[1]])
+                        sub = H
                     logits = model(sub, [ev])
                     logits_list.append(logits[0])
 
@@ -192,8 +207,7 @@ def eval_epoch(
                 all_labels.append(batch_labels.cpu())
 
         finally:
-            if executor is not None:
-                executor.shutdown(wait=True)
+            pass
 
     avg_loss = total_loss / max(num_batches, 1)
     accuracy = correct / max(total, 1)
@@ -228,6 +242,8 @@ def main():
     parser.add_argument("--patience", type=int, default=3, help="Early stopping patience")
     parser.add_argument("--use-enhanced", action="store_true", help="Use enhanced model with rich features")
     parser.add_argument("--fast-mode", action="store_true", help="Fast mode: skip attention and hop distance")
+    parser.add_argument("--recency-feature", action="store_true", help="Append log-scaled recency scalar to edge features (requires retrain when enabled)")
+    parser.add_argument("--recency-norm", type=float, default=52.0, help="Normalization scale for recency feature (e.g., weeks)")
     parser.add_argument("--skip-hopdist", action="store_true", help="Skip hop-distance computation only (keep attention)")
     parser.add_argument("--log-interval", type=int, default=100, help="Batches between progress logs")
     parser.add_argument("--time-aware", action="store_true", help="Use time-aware dataset with (u,v,t) and true-zero negatives")
@@ -260,7 +276,7 @@ def main():
     print("Building model...")
     if args.use_enhanced:
         print("  → Using enhanced model with attention and rich features")
-        model = build_enhanced_model(G, hidden_dim=args.hidden_dim, num_layers=args.num_layers, fast_mode=args.fast_mode, skip_hopdist=args.skip_hopdist)
+        model = build_enhanced_model(G, hidden_dim=args.hidden_dim, num_layers=args.num_layers, fast_mode=args.fast_mode, skip_hopdist=args.skip_hopdist, recency_feature=args.recency_feature, recency_norm=args.recency_norm)
     else:
         print("  → Using simple baseline model")
         model = build_model(G, hidden_dim=args.hidden_dim, num_layers=args.num_layers)
@@ -271,12 +287,26 @@ def main():
     best_val_loss = float("inf")
     patience_counter = 0
 
+    # Create a long-lived process pool if requested
+    mp_ctx = None
+    executor: concurrent.futures.ProcessPoolExecutor | None = None
+    if args.num_workers and args.num_workers > 0:
+        import multiprocessing as _mp
+        mp_ctx = _mp.get_context("spawn")
+        executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            mp_context=mp_ctx,
+            initializer=_init_worker,
+            initargs=(G, args.hops, args.K),
+        )
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Parallel sampling enabled with {args.num_workers} workers (spawn)")
+
     for epoch in range(1, args.epochs + 1):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Epoch {epoch}/{args.epochs} starting ...")
         train_loss = train_epoch(
-            model, optimizer, G, train_data, batch_size=args.batch_size, hops=args.hops, K=args.K, device=str(device), log_interval=args.log_interval, num_workers=args.num_workers
+            model, optimizer, G, train_data, batch_size=args.batch_size, hops=args.hops, K=args.K, device=str(device), log_interval=args.log_interval, num_workers=args.num_workers, executor=executor
         )
-        val_loss, val_acc = eval_epoch(model, G, val_data, batch_size=args.batch_size * 2, hops=args.hops, K=args.K, device=str(device), num_workers=max(0, args.num_workers // 2))
+        val_loss, val_acc = eval_epoch(model, G, val_data, batch_size=args.batch_size * 2, hops=args.hops, K=args.K, device=str(device), num_workers=max(0, args.num_workers // 2), executor=executor)
         print(f"Epoch {epoch}/{args.epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
 
         if val_loss < best_val_loss:
@@ -287,14 +317,17 @@ def main():
             torch.save(
                 {
                     "model_state": model.state_dict(),
-                    "node_types": model.node_types,
+                    "node_types": getattr(model, "node_types", None),
                     "categorical_attrs": getattr(model, "categorical_attrs", None),
+                    "cat_val2idx": getattr(model, "cat_val2idx", None),
                     "hidden_dim": args.hidden_dim,
                     "num_layers": args.num_layers,
                     "hops": args.hops,
                     "K": args.K,
-                    "fast_mode": args.fast_mode,
-                    "skip_hopdist": args.skip_hopdist,
+                    "fast_mode": getattr(model, "fast_mode", False),
+                    "skip_hopdist": getattr(model, "skip_hopdist", False),
+                    "recency_feature": getattr(model, "recency_feature", False),
+                    "recency_norm": getattr(model, "recency_norm", 52.0),
                 },
                 out_path,
             )
@@ -304,6 +337,10 @@ def main():
             if patience_counter >= args.patience:
                 print(f"Early stopping at epoch {epoch}")
                 break
+
+    # Shutdown pool if created
+    if executor is not None:
+        executor.shutdown(wait=True)
 
     print("Training complete.")
 
