@@ -132,6 +132,27 @@ python -u scripts/evaluate_scorer.py \
   --calibrator checkpoints/calibrators/iso_val.pkl
 ```
 
+### Production checkpoint
+
+- Checkpoint: `checkpoints/vn2_temporal_scorer_timeaware_recency.pt`
+- Frozen copy: `checkpoints/prod/vn2_temporal_scorer_timeaware_recency_2025-10-09.pt`
+- Calibrator: `checkpoints/calibrators/iso_val_2024-03-15.pkl`
+- Train flags: `--epochs 10 --batch-size 256 --hidden-dim 64 --num-layers 3 --K 30 --hops 1 --use-enhanced --recency-feature --recency-norm 52 --lr 0.001 --patience 3 --log-interval 10 --num-workers 6 --time-aware`
+- Eval flags: `--train-end 2024-01-31 --val-end 2024-03-15 --hops 1 --K 30 --time-aware`
+- Metrics:
+  - Raw Test AUC 0.6444, AP 0.7312
+  - Calibrated Test AUC 0.6499, AP 0.7182
+
+Example (calibrated inference):
+```bash
+python -u scripts/evaluate_scorer.py \
+  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --ckpt checkpoints/prod/vn2_temporal_scorer_timeaware_recency_2025-10-09.pt \
+  --train-end 2024-01-31 --val-end 2024-03-15 \
+  --hops 1 --K 30 --time-aware \
+  --calibrator checkpoints/calibrators/iso_val_2024-03-15.pkl
+```
+
 ### 4. Extract probabilities for VN2 ordering policy
 ```python
 from graph_qa.io.loader import load_graph
