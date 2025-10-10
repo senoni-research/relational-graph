@@ -145,6 +145,50 @@ def _expected_cost(mu_H: np.ndarray, sigma_H: np.ndarray, S: np.ndarray, cost_sh
     CoH = float(cost_holding_per_week) * float(horizon)
     return float(np.sum(Cu * under + CoH * over))
 
+# Fast inverse normal CDF approximation (Abramowitz-Stegun style)
+def inv_norm_cdf(p: float) -> float:
+    p = float(max(1e-12, min(1-1e-12, p)))
+    a1 = -39.69683028665376
+    a2 = 220.9460984245205
+    a3 = -275.9285104469687
+    a4 = 138.3577518672690
+    a5 = -30.66479806614716
+    a6 = 2.506628277459239
+    b1 = -54.47609879822406
+    b2 = 161.5858368580409
+    b3 = -155.6989798598866
+    b4 = 66.80131188771972
+    b5 = -13.28068155288572
+    c1 = -0.007784894002430293
+    c2 = -0.3223964580411365
+    c3 = -2.400758277161838
+    c4 = -2.549732539343734
+    c5 = 4.374664141464968
+    c6 = 2.938163982698783
+    d1 = 0.007784695709041462
+    d2 = 0.3224671290700398
+    d3 = 2.445134137142996
+    d4 = 3.754408661907416
+    plow = 0.02425
+    phigh = 1 - plow
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / (
+            ((((d1 * q + d2) * q + d3) * q + d4) * q + 1)
+        )
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / (
+            ((((d1 * q + d2) * q + d3) * q + d4) * q + 1)
+        )
+    q = p - 0.5
+    r = q * q
+    return (
+        (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q
+    ) / (
+        (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1)
+    )
+
 def _sanity_print(submissions: list[dict], hb_map: Dict[Tuple[str,str], int], k: int = 50) -> None:
     try:
         p_arr = np.array([float(s.get("p_t3", 0.0)) for s in submissions])
@@ -212,7 +256,7 @@ def main():
     ap.add_argument("--submit", default=None, type=str, help="If provided, write 599-row orders.csv here with order_qty column")
     ap.add_argument("--beta", default=0.833, type=float, help="Critical fractile (default 1/(1+0.2))")
     ap.add_argument("--features-599", default=None, type=str, help="If provided, write 599-row features aligned to index (includes p_t1..p_t3)")
-    ap.add_argument("--blend", default="none", choices=["none","hb","graph","gated","shrink"], help="Blend submission strategy")
+    ap.add_argument("--blend", default="none", choices=["none","hb","graph","gated","shrink","cap"], help="Blend submission strategy")
     ap.add_argument("--hb", default=None, type=str, help="Path to HB submission CSV (store_id,product_id,order_qty)")
     ap.add_argument("--tau", default=0.6, type=float, help="Gating threshold on p_t3 for blend=gated")
     ap.add_argument("--alpha", default=0.3, type=float, help="Shrink factor on HB when p<tau for blend=gated")
@@ -402,7 +446,16 @@ def main():
         # Write blended with best params
         if args.submit_blended:
             w = np.where(p >= best_tau, 1.0, best_alpha)
-            q = np.rint(np.clip(w * hbq, 0.0, None)).astype(int)
+            if args.blend == "cap":
+                # cap: low-p -> min(HB, Graph); τ-only grid, ignore alpha
+                # approximate graph orders via base-stock from features if available; else use HB as fallback cap
+                # Here in grid, we cap with HB only (no graph q), so cap reduces to HB when p>=τ, else HB (no increase).
+                # For simplicity in grid cost proxy, emulate strict cap by not increasing low-p beyond HB.
+                q = np.rint(np.clip(hbq, 0.0, None)).astype(int)
+                low = p < best_tau
+                # Optionally reduce low-p slightly (no increase): keep as HB for proxy
+            else:
+                q = np.rint(np.clip(w * hbq, 0.0, None)).astype(int)
             out = df[["store_id","product_id"]].copy()
             out["order_qty"] = q
             out.to_csv(args.submit_blended, index=False)
@@ -560,12 +613,17 @@ def main():
                     q_hb = hb_map.get(key, q_graph)
                     w = 1.0 if p >= tau else alpha
                     q_final = int(round(max(0.0, w * q_hb + (1.0 - w) * q_graph)))
-                else:  # shrink: if p>=tau keep HB; else shrink toward zero (alpha * HB)
+                elif args.blend == "shrink":  # if p>=tau keep HB; else shrink toward zero (alpha * HB)
                     p = float(s.get("p_t3", 0.0))
                     tau = float(args.tau)
                     alpha = float(args.alpha)
                     q_hb = hb_map.get(key, q_graph)
                     q_final = int(round(max(0.0, q_hb if p >= tau else alpha * q_hb)))
+                else:  # cap: low-p -> min(HB, Graph); high-p -> HB
+                    p = float(s.get("p_t3", 0.0))
+                    tau = float(args.tau)
+                    q_hb = hb_map.get(key, q_graph)
+                    q_final = int(round(max(0.0, q_hb if p >= tau else min(q_hb, q_graph))))
                 blended.append({"store_id": s["store_id"], "product_id": s["product_id"], "order_qty": int(q_final)})
 
             out_path = args.submit_blended or (args.submit if args.submit else "orders_blended.csv")
