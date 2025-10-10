@@ -454,8 +454,10 @@ def main():
                 beta = 0.833
                 z = inv_norm_cdf(beta)
                 S = mu_H + z * sigma_H
-                onhand = pd.to_numeric(df.get("onhand", 0.0), errors="coerce").fillna(0.0).to_numpy()
-                onorder = pd.to_numeric(df.get("onorder_le2", 0.0), errors="coerce").fillna(0.0).to_numpy()
+                onhand_series = df["onhand"] if "onhand" in df.columns else pd.Series(0.0, index=df.index)
+                onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
+                onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
+                onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
                 IP = onhand + onorder
                 q_graph = np.rint(np.clip(S - IP, 0.0, None)).astype(int)
                 # Apply cap: high-p -> HB; low-p -> min(HB, Graph)
