@@ -447,13 +447,19 @@ def main():
         if args.submit_blended:
             w = np.where(p >= best_tau, 1.0, best_alpha)
             if args.blend == "cap":
-                # cap: low-p -> min(HB, Graph); τ-only grid, ignore alpha
-                # approximate graph orders via base-stock from features if available; else use HB as fallback cap
-                # Here in grid, we cap with HB only (no graph q), so cap reduces to HB when p>=τ, else HB (no increase).
-                # For simplicity in grid cost proxy, emulate strict cap by not increasing low-p beyond HB.
-                q = np.rint(np.clip(hbq, 0.0, None)).astype(int)
-                low = p < best_tau
-                # Optionally reduce low-p slightly (no increase): keep as HB for proxy
+                # cap: low-p -> min(HB, Graph); high-p -> HB
+                # Compute graph orders from features (base-stock)
+                mu_H = pd.to_numeric(df.get("mu_H", 0.0), errors="coerce").fillna(0.0).to_numpy()
+                sigma_H = pd.to_numeric(df.get("sigma_H", 1e-6), errors="coerce").fillna(1e-6).to_numpy()
+                beta = 0.833
+                z = inv_norm_cdf(beta)
+                S = mu_H + z * sigma_H
+                onhand = pd.to_numeric(df.get("onhand", 0.0), errors="coerce").fillna(0.0).to_numpy()
+                onorder = pd.to_numeric(df.get("onorder_le2", 0.0), errors="coerce").fillna(0.0).to_numpy()
+                IP = onhand + onorder
+                q_graph = np.rint(np.clip(S - IP, 0.0, None)).astype(int)
+                # Apply cap: high-p -> HB; low-p -> min(HB, Graph)
+                q = np.where(p >= best_tau, hbq, np.minimum(hbq, q_graph)).astype(int)
             else:
                 q = np.rint(np.clip(w * hbq, 0.0, None)).astype(int)
             out = df[["store_id","product_id"]].copy()
