@@ -106,8 +106,8 @@ def _phi(z: np.ndarray) -> np.ndarray:
     return np.exp(-0.5 * z * z) / SQRT2PI
 
 def _Phi(z: np.ndarray) -> np.ndarray:
-    # Normal CDF via erf (numpy); SciPy-free
-    return 0.5 * (1.0 + np.erf(z / math.sqrt(2.0)))
+    # Normal CDF via math.erf; vectorized for numpy arrays (SciPy-free)
+    return 0.5 * (1.0 + np.vectorize(math.erf)(z / math.sqrt(2.0)))
 
 def _compute_mu_sigma_H_from_rows(rows: list[dict], horizon: int) -> tuple[np.ndarray, np.ndarray]:
     # rows: list of feature dicts with p_t1..p_t3, mu_hat_plus, sigma_hat_plus
