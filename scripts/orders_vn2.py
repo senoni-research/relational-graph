@@ -562,7 +562,6 @@ def main():
             # Sanity checks
             try:
                 # Build quick lookup arrays for checks
-                import numpy as np
                 p_arr = np.array([float(s.get("p_t3", 0.0)) for s in submissions])
                 hb_arr = np.array([hb_map.get((s["store_id"], s["product_id"]), 0) for s in submissions], dtype=float)
                 gr_arr = np.array([s["order_qty"] for s in submissions], dtype=float)
