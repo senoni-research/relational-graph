@@ -23,6 +23,8 @@ import math
 import pickle
 from datetime import date, timedelta
 from typing import Dict, Tuple, Any
+import numpy as np
+import pandas as pd
 
 import networkx as nx
 import torch
@@ -97,6 +99,66 @@ def score_edge(model: torch.nn.Module, G: nx.Graph, edge: Tuple[Any, Any, int], 
         return float(prob)
 
 
+# === Sanity / Grid helpers ===
+SQRT2PI = math.sqrt(2.0 * math.pi)
+
+def _phi(z: np.ndarray) -> np.ndarray:
+    return np.exp(-0.5 * z * z) / SQRT2PI
+
+def _Phi(z: np.ndarray) -> np.ndarray:
+    # Normal CDF via erf (numpy); SciPy-free
+    return 0.5 * (1.0 + np.erf(z / math.sqrt(2.0)))
+
+def _compute_mu_sigma_H_from_rows(rows: list[dict], horizon: int) -> tuple[np.ndarray, np.ndarray]:
+    # rows: list of feature dicts with p_t1..p_t3, mu_hat_plus, sigma_hat_plus
+    df = {k: [] for k in ("mu_hat_plus","sigma_hat_plus","p_t1","p_t2","p_t3")}
+    for r in rows:
+        df["mu_hat_plus"].append(float(r.get("mu_hat_plus", 1.0)))
+        df["sigma_hat_plus"].append(float(r.get("sigma_hat_plus", 1.0)))
+        df["p_t1"].append(float(r.get("p_t1", r.get("p_mean", 0.5))))
+        df["p_t2"].append(float(r.get("p_t2", r.get("p_mean", 0.5))))
+        df["p_t3"].append(float(r.get("p_t3", r.get("p_mean", 0.5))))
+    mu_plus = np.asarray(df["mu_hat_plus"], dtype=float)
+    sigma_plus = np.asarray(df["sigma_hat_plus"], dtype=float)
+    p1 = np.asarray(df["p_t1"], dtype=float)
+    p2 = np.asarray(df["p_t2"], dtype=float)
+    p3 = np.asarray(df["p_t3"], dtype=float)
+    p_weeks = [p1, p2, p3]
+    if horizon > 3:
+        p_weeks = p_weeks + [p3] * (horizon - 3)
+    p_weeks = p_weeks[:horizon]
+    lam = [pw * mu_plus for pw in p_weeks]
+    var = [pw * (sigma_plus ** 2) + pw * (1.0 - pw) * (mu_plus ** 2) for pw in p_weeks]
+    mu_H = np.sum(lam, axis=0)
+    var_H = np.sum(var, axis=0)
+    sigma_H = np.sqrt(np.maximum(1e-12, var_H))
+    return mu_H, sigma_H
+
+def _expected_cost(mu_H: np.ndarray, sigma_H: np.ndarray, S: np.ndarray, cost_shortage: float, cost_holding_per_week: float, horizon: int) -> float:
+    z = (S - mu_H) / sigma_H
+    small = sigma_H < 1e-8
+    under = sigma_H * _phi(z) + (mu_H - S) * (1.0 - _Phi(z))
+    over  = sigma_H * _phi(z) + (S - mu_H) * _Phi(z)
+    under[small] = np.maximum(0.0, mu_H[small] - S[small])
+    over[small]  = np.maximum(0.0, S[small] - mu_H[small])
+    Cu = float(cost_shortage)
+    CoH = float(cost_holding_per_week) * float(horizon)
+    return float(np.sum(Cu * under + CoH * over))
+
+def _sanity_print(submissions: list[dict], hb_map: Dict[Tuple[str,str], int], k: int = 50) -> None:
+    try:
+        p_arr = np.array([float(s.get("p_t3", 0.0)) for s in submissions])
+        hb_arr = np.array([hb_map.get((s["store_id"], s["product_id"]), 0) for s in submissions], dtype=float)
+        bl_arr = np.array([s.get("order_qty_blend", s["order_qty"]) for s in submissions], dtype=float)
+        top_idx = np.argsort(-p_arr)[:k]
+        bot_idx = np.argsort(p_arr)[:k]
+        top_keep = float((bl_arr[top_idx] >= hb_arr[top_idx]).mean()) if len(top_idx) else 0.0
+        bot_shrink = float((bl_arr[bot_idx] <= hb_arr[bot_idx]).mean()) if len(bot_idx) else 0.0
+        print(f"Sanity: top-{k} keep-rate={top_keep:.2f}, bottom-{k} shrink-rate={bot_shrink:.2f}")
+    except Exception as e:
+        print(f"[warn] sanity calc failed: {e}")
+
+
 def compute_mu_sigma_plus(G: nx.Graph, train_end: int) -> Tuple[Dict[str, float], Dict[str, float]]:
     # Estimate per-product mu_plus, sigma_plus from training window (units>0 on 'sold')
     per_product_values: Dict[str, list] = {}
@@ -149,6 +211,20 @@ def main():
     ap.add_argument("--state", default=None, type=str, help="CSV with columns store_id,product_id,onhand,onorder_le2")
     ap.add_argument("--submit", default=None, type=str, help="If provided, write 599-row orders.csv here with order_qty column")
     ap.add_argument("--beta", default=0.833, type=float, help="Critical fractile (default 1/(1+0.2))")
+    ap.add_argument("--features-599", default=None, type=str, help="If provided, write 599-row features aligned to index (includes p_t1..p_t3)")
+    ap.add_argument("--blend", default="none", choices=["none","hb","graph","gated","shrink"], help="Blend submission strategy")
+    ap.add_argument("--hb", default=None, type=str, help="Path to HB submission CSV (store_id,product_id,order_qty)")
+    ap.add_argument("--tau", default=0.6, type=float, help="Gating threshold on p_t3 for blend=gated")
+    ap.add_argument("--alpha", default=0.3, type=float, help="Shrink factor on HB when p<tau for blend=gated")
+    ap.add_argument("--submit-blended", default=None, type=str, help="Path to write blended submission (599 rows)")
+    # Grid and cost-sim flags
+    ap.add_argument("--grid", action="store_true", help="Run tau/alpha grid and pick best by expected cost or sanity score")
+    ap.add_argument("--tau-grid", type=str, default=None, help="Comma-separated tau grid, e.g. '0.50,0.55,0.60'")
+    ap.add_argument("--alpha-grid", type=str, default=None, help="Comma-separated alpha grid, e.g. '0.30,0.50,0.70'")
+    ap.add_argument("--simulate-cost", action="store_true", help="Use expected-cost proxy (shortage=1, holding per week as given) when running --grid")
+    ap.add_argument("--cost-shortage", type=float, default=1.0, help="Shortage cost per unit for grid cost proxy")
+    ap.add_argument("--cost-holding", type=float, default=0.2, help="Holding cost per unit per week for grid cost proxy")
+    ap.add_argument("--sanity-k", type=int, default=50, help="Top/Bottom K for sanity keep/shrink checks")
     args = ap.parse_args()
 
     print(f"Loading graph from {args.graph}...")
@@ -188,9 +264,11 @@ def main():
             # Compute p(active) for each week in horizon
             week = start_week
             p_list = []
+            p_weeks = []
             for _ in range(int(args.horizon)):
                 prob = score_edge(model, G, (s, p, week), hops=args.hops, K=args.K, calibrator=calibrator)
                 p_list.append(prob)
+                p_weeks.append(prob)
                 # advance by 7 days
                 d = yyyymmdd_to_date(week) + timedelta(days=7)
                 week = int(d.strftime("%Y%m%d"))
@@ -205,18 +283,22 @@ def main():
                 mu_H += prob * prod_mu
                 var_H += prob * (prod_sigma ** 2) + prob * (1 - prob) * (prod_mu ** 2)
 
-            rows.append({
+            row = {
                 "store_id": s.replace("store:", ""),
                 "product_id": p.replace("product:", ""),
                 "start_week": start_week,
                 "horizon_weeks": int(args.horizon),
                 "p_mean": sum(p_list) / len(p_list),
                 "p_sum": sum(p_list),
+                "p_t1": p_weeks[0] if len(p_weeks) > 0 else 0.0,
+                "p_t2": p_weeks[1] if len(p_weeks) > 1 else (p_weeks[0] if p_weeks else 0.0),
+                "p_t3": p_weeks[2] if len(p_weeks) > 2 else (p_weeks[-1] if p_weeks else 0.0),
                 "mu_hat_plus": prod_mu,
                 "sigma_hat_plus": prod_sigma,
                 "mu_H": mu_H,
                 "sigma_H": math.sqrt(max(1e-6, var_H)),
-            })
+            }
+            rows.append(row)
 
     print(f"Writing {len(rows)} rows to {args.out}...")
     with open(args.out, "w", newline="") as f:
@@ -226,8 +308,103 @@ def main():
     print("Done.")
 
     # Optional: produce 599-row submission file in platform order
-    if args.submission_index and args.submit:
-        print(f"Producing submission from index {args.submission_index} -> {args.submit}")
+    # Optionally write 599-row features aligned to index
+    if args.submission_index and args.features_599:
+        print(f"Writing 599-row features to {args.features_599}")
+        feat_map: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for r in rows:
+            feat_map[(str(r["store_id"]), str(r["product_id"]))] = r
+        with open(args.submission_index, "r") as idxf, open(args.features_599, "w", newline="") as outf:
+            idxr = csv.DictReader(idxf)
+            fieldnames = ["store_id","product_id","p_t1","p_t2","p_t3","mu_hat_plus","sigma_hat_plus","mu_H","sigma_H"]
+            writer = csv.DictWriter(outf, fieldnames=fieldnames)
+            writer.writeheader()
+            count = 0
+            for idxrow in idxr:
+                sid = str(idxrow.get("store_id", ""))
+                pid = str(idxrow.get("product_id", ""))
+                feat = feat_map.get((sid, pid), {})
+                writer.writerow({
+                    "store_id": sid,
+                    "product_id": pid,
+                    "p_t1": feat.get("p_t1", 0.0),
+                    "p_t2": feat.get("p_t2", 0.0),
+                    "p_t3": feat.get("p_t3", 0.0),
+                    "mu_hat_plus": feat.get("mu_hat_plus", 0.0),
+                    "sigma_hat_plus": feat.get("sigma_hat_plus", 0.0),
+                    "mu_H": feat.get("mu_H", 0.0),
+                    "sigma_H": feat.get("sigma_H", 0.0),
+                })
+                count += 1
+        print(f"Wrote {count} feature rows to {args.features_599}")
+
+    # === τ/α grid (if requested) ===
+    if args.grid:
+        if not args.hb:
+            raise SystemExit("--grid requires --hb")
+        if not args.features_599:
+            raise SystemExit("--grid requires --features-599")
+        print("Running τ/α grid...")
+        tau_list = [float(x.strip()) for x in (args.tau_grid.split(",") if args.tau_grid else ["0.50","0.55","0.60"])]
+        alpha_list = [float(x.strip()) for x in (args.alpha_grid.split(",") if args.alpha_grid else ["0.30","0.50","0.70"])]
+        # Load features and HB for grid
+        feat = pd.read_csv(args.features_599)
+        hb = pd.read_csv(args.hb)
+        for d in (feat, hb):
+            cols = {c.lower(): c for c in d.columns}
+            sid = cols.get("store_id", list(d.columns)[0])
+            pid = cols.get("product_id", list(d.columns)[1])
+            d.rename(columns={sid:"store_id", pid:"product_id"}, inplace=True)
+            d["store_id"] = d["store_id"].astype(str)
+            d["product_id"] = d["product_id"].astype(str)
+        hb_qty_col = next((c for c in hb.columns if c.lower() in {"order_qty","orders","qty","0"}), hb.columns[-1])
+        df = feat.merge(hb[["store_id","product_id", hb_qty_col]], on=["store_id","product_id"], how="left")
+        hbq = pd.to_numeric(df[hb_qty_col], errors="coerce").fillna(0.0).to_numpy()
+        pcol = "p_t3" if "p_t3" in df.columns else df.columns[2]
+        p = pd.to_numeric(df[pcol], errors="coerce").fillna(0.5).to_numpy()
+        
+        best_tau, best_alpha, best_score = None, None, float("inf") if args.simulate_cost else -float("inf")
+        print("τ/α grid:")
+        for tau in tau_list:
+            logs = []
+            for alpha in alpha_list:
+                w = np.where(p >= tau, 1.0, alpha)
+                q = np.rint(np.clip(w * hbq, 0.0, None)).astype(int)
+                if args.simulate_cost:
+                    # Compute expected cost
+                    mu_H_arr, sigma_H_arr = _compute_mu_sigma_H_from_rows(rows, args.horizon)
+                    onhand = pd.to_numeric(df.get("onhand", 0.0), errors="coerce").fillna(0.0).to_numpy()
+                    onorder = pd.to_numeric(df.get("onorder_le2", 0.0), errors="coerce").fillna(0.0).to_numpy()
+                    cost = _expected_cost(mu_H_arr, sigma_H_arr, onhand + onorder + q, args.cost_shortage, args.cost_holding, args.horizon)
+                    score = cost
+                    logs.append(f"α={alpha:.2f} cost={cost:.2f}")
+                    better = cost < best_score
+                else:
+                    top_idx = np.argsort(-p)[:args.sanity_k]
+                    bot_idx = np.argsort(p)[:args.sanity_k]
+                    keep_rate = float(np.mean(q[top_idx] >= hbq[top_idx]))
+                    shrink_rate = float(np.mean(q[bot_idx] <= hbq[bot_idx]))
+                    score = keep_rate + shrink_rate
+                    logs.append(f"α={alpha:.2f} score={score:.3f} (keep={keep_rate:.2f}, shrink={shrink_rate:.2f})")
+                    better = score > best_score
+                if better:
+                    best_score, best_tau, best_alpha = score, tau, alpha
+            print(f"  τ={tau:.2f} -> " + " | ".join(logs))
+        print(f"Best: τ={best_tau:.2f}, α={best_alpha:.2f}, {'cost' if args.simulate_cost else 'score'}={best_score:.3f}")
+        
+        # Write blended with best params
+        if args.submit_blended:
+            w = np.where(p >= best_tau, 1.0, best_alpha)
+            q = np.rint(np.clip(w * hbq, 0.0, None)).astype(int)
+            out = df[["store_id","product_id"]].copy()
+            out["order_qty"] = q
+            out.to_csv(args.submit_blended, index=False)
+            print(f"Wrote blended submission {args.submit_blended} with best τ={best_tau:.2f}, α={best_alpha:.2f}")
+            _sanity_print(submissions, dict(zip(zip(df.store_id, df.product_id), hbq)), k=args.sanity_k)
+
+    if args.submission_index and (args.submit or args.submit_blended or args.blend in ("hb","graph","gated","shrink")):
+        if args.submit:
+            print(f"Producing submission from index {args.submission_index} -> {args.submit}")
         # Load features into a lookup
         feat_map: Dict[Tuple[str, str], Dict[str, float]] = {}
         for r in rows:
@@ -317,14 +494,94 @@ def main():
                 onhand, onorder = state_map.get(key, (0.0, 0.0))
                 IP = onhand + onorder
                 q = max(0.0, S - IP)
-                submissions.append({"store_id": sid, "product_id": pid, "order_qty": int(round(q))})
+                submissions.append({"store_id": sid, "product_id": pid, "order_qty": int(round(q)), "p_t3": float(feat.get("p_t3", 0.0)) if feat else 0.0})
 
-        # Write submission
-        with open(args.submit, "w", newline="") as sf:
-            writer = csv.DictWriter(sf, fieldnames=["store_id", "product_id", "order_qty"])
-            writer.writeheader()
-            writer.writerows(submissions)
-        print(f"Wrote submission {args.submit} with {len(submissions)} rows.")
+        # Optional blending
+        if args.blend in ("hb","graph","gated"):
+            # Load HB if needed
+            hb_map: Dict[Tuple[str, str], int] = {}
+            if args.blend in ("hb","gated"):
+                if not args.hb:
+                    raise SystemExit("--hb is required when --blend is hb or gated")
+                with open(args.hb, "r") as hf:
+                    hr = csv.DictReader(hf)
+                    # Robust column detection
+                    cols = [c for c in hr.fieldnames or []]
+                    def pick(colnames, candidates):
+                        for cand in candidates:
+                            for c in colnames:
+                                if c.lower().strip() == cand:
+                                    return c
+                        for c in colnames:
+                            cl = c.lower()
+                            if any(tok in cl for tok in candidates):
+                                return c
+                        return None
+                    s_col = pick(cols, ["store_id","store","store id","store#"]) or cols[0]
+                    p_col = pick(cols, ["product_id","product","product id","sku","item"]) or cols[1]
+                    q_col = pick(cols, ["order_qty","order","orders","quantity","qty"]) or cols[-1]
+                    for h in hr:
+                        key = (str(h.get(s_col, "")), str(h.get(p_col, "")))
+                        try:
+                            hb_val = int(round(float(h.get(q_col, 0) or 0)))
+                        except Exception:
+                            hb_val = 0
+                        hb_map[key] = hb_val
+
+            # Build blended orders
+            blended = []
+            for s in submissions:
+                key = (s["store_id"], s["product_id"])
+                q_graph = s["order_qty"]
+                if args.blend == "graph":
+                    q_final = q_graph
+                elif args.blend == "hb":
+                    q_final = hb_map.get(key, 0)
+                elif args.blend == "gated":
+                    p = float(s.get("p_t3", 0.0))
+                    tau = float(args.tau)
+                    alpha = float(args.alpha)
+                    # If HB missing, fall back to graph to avoid zeroing high-p items
+                    q_hb = hb_map.get(key, q_graph)
+                    w = 1.0 if p >= tau else alpha
+                    q_final = int(round(max(0.0, w * q_hb + (1.0 - w) * q_graph)))
+                else:  # shrink: if p>=tau keep HB; else shrink toward zero (alpha * HB)
+                    p = float(s.get("p_t3", 0.0))
+                    tau = float(args.tau)
+                    alpha = float(args.alpha)
+                    q_hb = hb_map.get(key, q_graph)
+                    q_final = int(round(max(0.0, q_hb if p >= tau else alpha * q_hb)))
+                blended.append({"store_id": s["store_id"], "product_id": s["product_id"], "order_qty": int(q_final)})
+
+            out_path = args.submit_blended or (args.submit if args.submit else "orders_blended.csv")
+            with open(out_path, "w", newline="") as bf:
+                writer = csv.DictWriter(bf, fieldnames=["store_id","product_id","order_qty"])
+                writer.writeheader()
+                writer.writerows(blended)
+            print(f"Wrote blended submission {out_path} with {len(blended)} rows (strategy={args.blend}).")
+            # Sanity checks
+            try:
+                # Build quick lookup arrays for checks
+                import numpy as np
+                p_arr = np.array([float(s.get("p_t3", 0.0)) for s in submissions])
+                hb_arr = np.array([hb_map.get((s["store_id"], s["product_id"]), 0) for s in submissions], dtype=float)
+                gr_arr = np.array([s["order_qty"] for s in submissions], dtype=float)
+                bl_arr = np.array([b["order_qty"] for b in blended], dtype=float)
+                top_idx = np.argsort(-p_arr)[:50]
+                bot_idx = np.argsort(p_arr)[:50]
+                top_keep = float((bl_arr[top_idx] >= hb_arr[top_idx]).mean()) if len(top_idx) else 0.0
+                bot_shrink = float((bl_arr[bot_idx] <= hb_arr[bot_idx]).mean()) if len(bot_idx) else 0.0
+                print(f"Sanity: top-50 keep-rate={top_keep:.2f}, bottom-50 shrink-rate={bot_shrink:.2f}")
+            except Exception:
+                pass
+        # Write pure-graph submission if requested
+        if args.submit:
+            with open(args.submit, "w", newline="") as sf:
+                writer = csv.DictWriter(sf, fieldnames=["store_id", "product_id", "order_qty"])
+                writer.writeheader()
+                for s in submissions:
+                    writer.writerow({"store_id": s["store_id"], "product_id": s["product_id"], "order_qty": s["order_qty"]})
+            print(f"Wrote submission {args.submit} with {len(submissions)} rows.")
 
 
 if __name__ == "__main__":
