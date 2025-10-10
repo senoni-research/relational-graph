@@ -371,10 +371,17 @@ def main():
                 w = np.where(p >= tau, 1.0, alpha)
                 q = np.rint(np.clip(w * hbq, 0.0, None)).astype(int)
                 if args.simulate_cost:
-                    # Compute expected cost
-                    mu_H_arr, sigma_H_arr = _compute_mu_sigma_H_from_rows(rows, args.horizon)
-                    onhand = pd.to_numeric(df.get("onhand", 0.0), errors="coerce").fillna(0.0).to_numpy()
-                    onorder = pd.to_numeric(df.get("onorder_le2", 0.0), errors="coerce").fillna(0.0).to_numpy()
+                    # Compute expected cost using per-row mu_H/sigma_H if present; else derive from features
+                    if "mu_H" in df.columns and "sigma_H" in df.columns:
+                        mu_H_arr = pd.to_numeric(df["mu_H"], errors="coerce").fillna(0.0).to_numpy()
+                        sigma_H_arr = pd.to_numeric(df["sigma_H"], errors="coerce").fillna(1e-6).to_numpy()
+                    else:
+                        mu_H_arr, sigma_H_arr = _compute_mu_sigma_H_from_rows(rows, args.horizon)
+                    # Inventory position components (default to zeros if not provided)
+                    onhand_series = df["onhand"] if "onhand" in df.columns else pd.Series(0.0, index=df.index)
+                    onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
+                    onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
+                    onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
                     cost = _expected_cost(mu_H_arr, sigma_H_arr, onhand + onorder + q, args.cost_shortage, args.cost_holding, args.horizon)
                     score = cost
                     logs.append(f"α={alpha:.2f} cost={cost:.2f}")
@@ -400,7 +407,15 @@ def main():
             out["order_qty"] = q
             out.to_csv(args.submit_blended, index=False)
             print(f"Wrote blended submission {args.submit_blended} with best τ={best_tau:.2f}, α={best_alpha:.2f}")
-            _sanity_print(submissions, dict(zip(zip(df.store_id, df.product_id), hbq)), k=args.sanity_k)
+            # Local sanity: keep HB at high-p, shrink at low-p
+            try:
+                top_idx = np.argsort(-p)[:args.sanity_k]
+                bot_idx = np.argsort(p)[:args.sanity_k]
+                keep_rate = float(np.mean(q[top_idx] >= hbq[top_idx])) if len(top_idx) else 0.0
+                shrink_rate = float(np.mean(q[bot_idx] <= hbq[bot_idx])) if len(bot_idx) else 0.0
+                print(f"Sanity: top-{args.sanity_k} keep-rate={keep_rate:.2f}, bottom-{args.sanity_k} shrink-rate={shrink_rate:.2f}")
+            except Exception as e:
+                print(f"[warn] sanity calc failed: {e}")
 
     if args.submission_index and (args.submit or args.submit_blended or args.blend in ("hb","graph","gated","shrink")):
         if args.submit:
