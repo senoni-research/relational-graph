@@ -518,8 +518,8 @@ def main():
                 # Critical fractile to z (approx without scipy)
                 # For beta=0.833, z ≈ 0.967. For general beta, use probit approximation.
                 beta = max(1e-6, min(1 - 1e-6, float(args.beta)))
-                # Abramowitz-Stegun approximation for inverse normal CDF
-                def inv_norm_cdf(p: float) -> float:
+                # Abramowitz-Stegun approximation for inverse normal CDF (local to avoid shadowing global)
+                def _inv_norm_cdf_local(p: float) -> float:
                     # Source: Wichura algorithm approximation (simplified)
                     # Good enough for beta near 0.8–0.9
                     a1 = -39.69683028665376
@@ -563,7 +563,7 @@ def main():
                         (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1)
                     )
 
-                z = inv_norm_cdf(beta)
+                z = _inv_norm_cdf_local(beta)
                 S = mu_H + z * sigma_H
                 onhand, onorder = state_map.get(key, (0.0, 0.0))
                 IP = onhand + onorder
