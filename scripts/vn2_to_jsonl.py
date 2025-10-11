@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Iterable, List, Set
 
 import pandas as pd
+import math
+from datetime import date as _date
 
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -242,17 +244,16 @@ def build_graph_records_v2(
     stores: Set[str] = {canon_id("store", r["Store"]) for _, r in sales.iterrows()}
     products: Set[str] = {canon_id("product", r["Product"]) for _, r in sales.iterrows()}
 
-    # Attributes
-    prod_attr_cols = [c for c in master.columns if c not in ("Store", "Product")]
+    # Attributes (fixed split: product-level vs store-level)
+    prod_cols = [c for c in ["ProductGroup","Division","Department","DepartmentGroup"] if c in master.columns]
+    store_cols = [c for c in ["StoreFormat","Format","Region"] if c in master.columns]
     prod_attrs = (
-        master.drop(columns=["Store"]).drop_duplicates(subset=["Product"]).set_index("Product")[prod_attr_cols]
-        if prod_attr_cols
-        else pd.DataFrame()
+        master[["Product"] + prod_cols].drop_duplicates(subset=["Product"]).set_index("Product")[prod_cols]
+        if prod_cols else pd.DataFrame()
     )
-    sf_cols = [c for c in ["StoreFormat", "Format", "Region"] if c in master.columns]
     store_formats = (
-        master.drop(columns=["Product"]).drop_duplicates(subset=["Store"]).set_index("Store")[sf_cols]
-        if sf_cols else pd.DataFrame()
+        master[["Store"] + store_cols].drop_duplicates(subset=["Store"]).set_index("Store")[store_cols]
+        if store_cols else pd.DataFrame()
     )
 
     # Meta + nodes
@@ -295,12 +296,8 @@ def build_graph_records_v2(
                     attrs[col] = val
         records.append({"type": "node", "id": pid, "attrs": attrs})
 
-    # Inventory booleans index
-    instock_bool = instock.copy()
-    for d in stock_dates:
-        if instock_bool[d].dtype != bool:
-            instock_bool[d] = instock_bool[d].astype(str).str.lower().isin(["true", "1", "yes", "y", "t"])
-    instock_idx = instock_bool.set_index(["Store", "Product"]) if not instock_bool.empty else None
+    # Inventory booleans index (preserve NA vs explicit false)
+    instock_idx = instock.set_index(["Store", "Product"]) if not instock.empty else None
 
     sales_dates_sorted = sales_dates
     date_ints = [ymd_to_int(d) for d in sales_dates_sorted]
@@ -322,7 +319,16 @@ def build_graph_records_v2(
 
         # Inventory series aligned
         if instock_idx is not None and pair_key in instock_idx.index:
-            inv_series = [bool(instock_idx.loc[pair_key].get(d, False)) for d in sales_dates_sorted]
+            inv_series = []
+            for d in sales_dates_sorted:
+                raw = instock_idx.loc[pair_key].get(d, None)
+                s = str(raw).strip().lower()
+                if s in ("true","1","yes","y","t"):
+                    inv_series.append(True)
+                elif s in ("false","0","no","n","f"):
+                    inv_series.append(False)
+                else:
+                    inv_series.append(False)  # treat NA as not explicitly present
         else:
             inv_series = [False] * len(sales_dates_sorted)
 
@@ -350,10 +356,20 @@ def build_graph_records_v2(
                     attrs["inv_present_now"] = bool(inv_present)
                     if t > 0:
                         attrs["stockout_last_w1"] = bool(not inv_series[t - 1])
+                # week-of-year seasonality (sin/cos)
+                try:
+                    iso_week = _date.fromisoformat(d).isocalendar().week
+                    attrs["woy_sin"] = math.sin(2 * math.pi * iso_week / 52.0)
+                    attrs["woy_cos"] = math.cos(2 * math.pi * iso_week / 52.0)
+                except Exception:
+                    pass
                 records.append({"type": "edge", "u": u, "v": v, "attrs": attrs})
 
             if inv_present:
                 records.append({"type": "edge", "u": u, "v": v, "attrs": {"rel": "has_inventory", "time": date_ints[t], "present": True}})
+            else:
+                # Optional: explicit no-inventory edge emitted later via flag; we record via a temporary marker
+                pass
 
             if units > 0.0:
                 last_sale_idx = t
@@ -379,6 +395,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-history-features", dest="add_history_features", action="store_false")
     ap.set_defaults(add_history_features=True)
     ap.add_argument("--history-windows", type=str, default="1,2,4,8", help="Comma-separated weeks for rolling sums")
+    ap.add_argument("--initial-state", type=str, default=None, help="Path to 'Week 0 - 2024-04-08 - Initial State.csv' to emit a state edge at anchor week")
+    ap.add_argument("--emit-no-inventory", action="store_true", help="Emit explicit no_inventory edges when source is an explicit false/0")
     return ap.parse_args()
 
 
@@ -409,6 +427,28 @@ def main() -> None:
             add_history_features=args.add_history_features,
             history_windows=windows,
         )
+        # Optional: add a single state edge per pair from Initial State at anchor week
+        if args.initial_state:
+            try:
+                state = pd.read_csv(args.initial_state, dtype={"Store": str, "Product": str})
+                anchor_date = "2024-04-08"
+                anchor_int = ymd_to_int(anchor_date)
+                for _, r in state.iterrows():
+                    u = f"store:{str(r.get('Store')).strip()}"
+                    v = f"product:{str(r.get('Product')).strip()}"
+                    attrs = {
+                        "rel": "state",
+                        "time": anchor_int,
+                        "start_inv": float(r.get("Start Inventory", 0) or 0),
+                        "in_transit_w1": float(r.get("In Transit W+1", 0) or 0),
+                        "in_transit_w2": float(r.get("In Transit W+2", 0) or 0),
+                        "missed_sales": float(r.get("Missed Sales", 0) or 0),
+                        "holding_cost": float(r.get("Holding Cost", 0) or 0),
+                        "shortage_cost": float(r.get("Shortage Cost", 0) or 0),
+                    }
+                    records.append({"type": "edge", "u": u, "v": v, "attrs": attrs})
+            except Exception as e:
+                print(f"[warn] failed to add initial state edges: {e}")
     else:
         records = build_graph_records(
             sales_path=sales_path,

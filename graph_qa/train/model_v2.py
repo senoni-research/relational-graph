@@ -264,17 +264,47 @@ class EnhancedEdgeScorer(nn.Module):
                 edge_feat_list.append(recency_scalar)
             # Event-bucket summaries (cheap aggregations over pre-t subgraph)
             if self.event_buckets:
-                # Compute per (s,p) recent window summaries; here approximate using degree/attributes on endpoints
+                # Consume precomputed v2 history attrs from the original graph nodes/edges if present
+                # We read from G_sub edge attrs for (u,v) at the last pre-t time if available
                 sales_buckets = []
                 stockout_buckets = []
                 inbound_buckets = []
                 onhand_buckets = []
-                for w in self.event_buckets:
-                    # Heuristic placeholders: can be replaced with true precomputed counters
-                    sales_buckets.append(1.0 if seen_before else 0.0)
+                # Initialize with zeros
+                for _ in self.event_buckets:
+                    sales_buckets.append(0.0)
                     stockout_buckets.append(0.0)
                     inbound_buckets.append(0.0)
                     onhand_buckets.append(0.0)
+                # Try to fetch lag_sum_w{w} and inv_present_now from edge attrs (closest pre-t)
+                try:
+                    if G_sub.has_edge(u, v):
+                        if isinstance(G_sub, nx.MultiGraph):
+                            # choose edge with max time < t_anchor
+                            best_edge = None
+                            best_time = -1
+                            data = G_sub.get_edge_data(u, v)
+                            for d in data.values():
+                                tt = d.get("time", -1)
+                                if t_anchor is None or (tt is not None and int(tt) < int(t_anchor)):
+                                    if int(tt) > best_time:
+                                        best_time = int(tt)
+                                        best_edge = d
+                            src = best_edge if best_edge is not None else {}
+                        else:
+                            src = G_sub.edges[u, v]
+                        for idx_w, w in enumerate(self.event_buckets):
+                            val = src.get(f"lag_sum_w{w}")
+                            if val is not None:
+                                sales_buckets[idx_w] = float(val)
+                        inv_now = src.get("inv_present_now")
+                        if inv_now is not None:
+                            onhand_buckets = [float(inv_now)] * len(self.event_buckets)
+                        stockout_last_w1 = src.get("stockout_last_w1")
+                        if stockout_last_w1 is not None:
+                            stockout_buckets = [float(bool(stockout_last_w1))] * len(self.event_buckets)
+                except Exception:
+                    pass
                 edge_feat_list.extend(sales_buckets + stockout_buckets + inbound_buckets + onhand_buckets)
 
             edge_feats = torch.tensor(edge_feat_list, dtype=torch.float32, device=device)
