@@ -150,8 +150,8 @@ def train_epoch(
 
             # Optional pairwise ranking loss using in-batch positives and negatives
             if rank_loss:
-                pos_idx = [i for i, (_, y) in enumerate(batch) if y == 1]
-                neg_idx = [i for i, (_, y) in enumerate(batch) if y == 0]
+                pos_idx = [i for i, y in enumerate(batch_y) if y == 1.0]
+                neg_idx = [i for i, y in enumerate(batch_y) if y == 0.0]
                 if pos_idx and neg_idx:
                     # Simple pairing: each pos against a random neg
                     import random as _r
@@ -389,6 +389,9 @@ def main():
                     "skip_hopdist": getattr(model, "skip_hopdist", False),
                     "recency_feature": getattr(model, "recency_feature", False),
                     "recency_norm": getattr(model, "recency_norm", 52.0),
+                    "event_buckets": [int(x.strip()) for x in (args.event_buckets.split(",") if args.event_buckets else []) if x.strip()] if hasattr(args, "event_buckets") else None,
+                    "rel_aware_attn": bool(getattr(args, "rel_aware_attn", False)),
+                    "negatives_policy": getattr(args, "negatives", None),
                 },
                 out_path,
             )

@@ -133,23 +133,15 @@ def evaluate_scorer(
                     t = None
                 seen = sub.has_edge(u, v)
                 (slices["seen_before"] if seen else slices["cold"]).append((prob, label))
-                # inventory-present tag: if time-aware triple and has has_inventory edge at t
+                # inventory-present tag: scan parallel edges for has_inventory at time t
                 inv = False
-                if isinstance(edge, (tuple, list)) and len(edge) == 3:
-                    if G.has_edge(u, v):
-                        if isinstance(G, type(G).to_networkx_class().__mro__[0]):
-                            inv = False
-                        # simple check across parallel edges
-                        if isinstance(G, type(G)):
-                            pass
-                    # cheap lookup by scanning neighbors (kept simple)
-                    if G.has_edge(u, v):
-                        data = G.get_edge_data(u, v)
-                        if isinstance(data, dict):
-                            for d in data.values():
-                                if d.get("rel") == "has_inventory" and str(d.get("time")) == str(t):
-                                    inv = True
-                                    break
+                if isinstance(edge, (tuple, list)) and len(edge) == 3 and G.has_edge(u, v):
+                    data = G.get_edge_data(u, v)
+                    if isinstance(data, dict):
+                        for d in data.values():
+                            if d.get("rel") == "has_inventory" and str(d.get("time")) == str(t):
+                                inv = True
+                                break
                 (slices["inv_present"] if inv else slices["no_inv"]).append((prob, label))
             except Exception:
                 pass

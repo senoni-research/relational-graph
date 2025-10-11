@@ -340,5 +340,6 @@ def mine_hard_negatives_timeaware(
                     negatives.append((s2, p, t))
                     if len(negatives) >= k * 2:
                         break
-    return negatives
+    # Dedupe
+    return list({(u, v, t) for (u, v, t) in negatives})
 
