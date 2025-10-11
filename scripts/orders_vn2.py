@@ -22,6 +22,7 @@ import csv
 import math
 import pickle
 from datetime import date, timedelta
+import os
 from typing import Dict, Tuple, Any
 import numpy as np
 import pandas as pd
@@ -240,6 +241,12 @@ def compute_mu_sigma_plus(G: nx.Graph, train_end: int) -> Tuple[Dict[str, float]
     return mu_plus, sigma_plus
 
 
+def _ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(str(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate VN2 order features from scorer + calibration")
     ap.add_argument("--graph", required=True, type=str)
@@ -345,6 +352,7 @@ def main():
             rows.append(row)
 
     print(f"Writing {len(rows)} rows to {args.out}...")
+    _ensure_parent_dir(args.out)
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -355,6 +363,7 @@ def main():
     # Optionally write 599-row features aligned to index
     if args.submission_index and args.features_599:
         print(f"Writing 599-row features to {args.features_599}")
+        _ensure_parent_dir(args.features_599)
         feat_map: Dict[Tuple[str, str], Dict[str, float]] = {}
         for r in rows:
             feat_map[(str(r["store_id"]), str(r["product_id"]))] = r
@@ -466,6 +475,7 @@ def main():
                 q = np.rint(np.clip(w * hbq, 0.0, None)).astype(int)
             out = df[["store_id","product_id"]].copy()
             out["order_qty"] = q
+            _ensure_parent_dir(args.submit_blended)
             out.to_csv(args.submit_blended, index=False)
             print(f"Wrote blended submission {args.submit_blended} with best τ={best_tau:.2f}, α={best_alpha:.2f}")
             # Local sanity: keep HB at high-p, shrink at low-p
@@ -635,6 +645,7 @@ def main():
                 blended.append({"store_id": s["store_id"], "product_id": s["product_id"], "order_qty": int(q_final)})
 
             out_path = args.submit_blended or (args.submit if args.submit else "orders_blended.csv")
+            _ensure_parent_dir(out_path)
             with open(out_path, "w", newline="") as bf:
                 writer = csv.DictWriter(bf, fieldnames=["store_id","product_id","order_qty"])
                 writer.writeheader()
@@ -656,6 +667,7 @@ def main():
                 pass
         # Write pure-graph submission if requested
         if args.submit:
+            _ensure_parent_dir(args.submit)
             with open(args.submit, "w", newline="") as sf:
                 writer = csv.DictWriter(sf, fieldnames=["store_id", "product_id", "order_qty"])
                 writer.writeheader()
