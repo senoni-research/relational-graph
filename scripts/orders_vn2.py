@@ -5,7 +5,7 @@ Outputs a CSV with columns:
   store_id,product_id,start_week,horizon_weeks,p_mean,p_sum,mu_hat_plus,sigma_hat_plus,mu_H,sigma_H
 
 Where mu_H and sigma_H are the zero-inflated horizon mean/std using calibrated p(active) for
-weeks [start_week, start_week + horizon-1]. 
+weeks [start_week, start_week + horizon-1].
 
 Example:
   python -u scripts/orders_vn2.py \
