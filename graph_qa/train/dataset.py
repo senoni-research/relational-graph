@@ -159,6 +159,7 @@ def build_time_aware_dataset(
     G: nx.Graph,
     train_end: str,
     val_end: str,
+    negatives: str = "inventory_only",
 ) -> Tuple[List[Tuple[EdgeT, int]], List[Tuple[EdgeT, int]], List[Tuple[EdgeT, int]]]:
     """
     Time-aware dataset:
@@ -216,9 +217,14 @@ def build_time_aware_dataset(
             else:
                 sold_zero.append((u, v, t))
 
-    # True zeros = inventory present AND sold==0
+    # Negatives
     sold_zero_set = set(sold_zero)
-    true_zero = list(sold_zero_set & inv_present)
+    if negatives == "inventory_only":
+        # True negatives: inventory present AND sold==0
+        true_zero = list(sold_zero_set & inv_present)
+    else:
+        # All recorded sold==0 as negatives (less recommended)
+        true_zero = list(sold_zero_set)
 
     # Split by time
     def split_by_time(samples: List[EdgeT]) -> Tuple[List[EdgeT], List[EdgeT], List[EdgeT]]:
@@ -247,4 +253,92 @@ def build_time_aware_dataset(
     random.shuffle(test_data)
 
     return train_data, val_data, test_data
+
+
+def mine_hard_negatives_timeaware(
+    G: nx.Graph,
+    positives: List[EdgeT],
+    k: int = 2,
+) -> List[EdgeT]:
+    """Mine simple hard negatives near positives using schema affinities.
+    Heuristics:
+      - same store, similar products by Department/Division
+      - same product, similar stores by StoreFormat/Format
+      Requires has_inventory at t and no sold>0 at t.
+    """
+    # Build similarity buckets
+    product_buckets: Dict[str, List[Any]] = {}
+    store_buckets: Dict[str, List[Any]] = {}
+    for n, a in G.nodes(data=True):
+        t = str(a.get("type", ""))
+        if t == "product":
+            key = str(a.get("Department", a.get("Division", "unknown")))
+            product_buckets.setdefault(key, []).append(n)
+        elif t == "store":
+            key = str(a.get("StoreFormat", a.get("Format", "unknown")))
+            store_buckets.setdefault(key, []).append(n)
+
+    # Fast inventory-present lookup
+    inv_present: set[EdgeT] | set = set()
+    if isinstance(G, nx.MultiGraph):
+        for u, v, key, attrs in G.edges(data=True, keys=True):
+            if attrs.get("rel") == "has_inventory" and bool(attrs.get("present", False)):
+                t = parse_time_attr(attrs.get("time", 0))
+                inv_present.add((u, v, t))
+    else:
+        for u, v, attrs in G.edges(data=True):
+            if attrs.get("rel") == "has_inventory" and bool(attrs.get("present", False)):
+                t = parse_time_attr(attrs.get("time", 0))
+                inv_present.add((u, v, t))
+
+    negatives: List[EdgeT] = []
+    for (s, p, t) in positives:
+        # same store, similar products
+        dept = str(G.nodes[p].get("Department", G.nodes[p].get("Division", "unknown")))
+        for p2 in product_buckets.get(dept, [])[: 4 * k]:
+            if p2 == p:
+                continue
+            if (s, p2, t) in inv_present:
+                # check sold at t
+                sold_pos = False
+                if G.has_edge(s, p2):
+                    if isinstance(G, nx.MultiGraph):
+                        for key in G[s][p2]:
+                            a = G[s][p2][key]
+                            if a.get("rel") == "sold" and parse_time_attr(a.get("time", 0)) == t and float(a.get("units", 0.0)) > 0.0:
+                                sold_pos = True
+                                break
+                    else:
+                        a = G.edges[s, p2]
+                        if a.get("rel") == "sold" and parse_time_attr(a.get("time", 0)) == t and float(a.get("units", 0.0)) > 0.0:
+                            sold_pos = True
+                if not sold_pos:
+                    negatives.append((s, p2, t))
+                    if len(negatives) >= k:
+                        break
+        if len(negatives) >= k:
+            continue
+        # same product, similar stores
+        fmt = str(G.nodes[s].get("StoreFormat", G.nodes[s].get("Format", "unknown")))
+        for s2 in store_buckets.get(fmt, [])[: 4 * k]:
+            if s2 == s:
+                continue
+            if (s2, p, t) in inv_present:
+                sold_pos = False
+                if G.has_edge(s2, p):
+                    if isinstance(G, nx.MultiGraph):
+                        for key in G[s2][p]:
+                            a = G[s2][p][key]
+                            if a.get("rel") == "sold" and parse_time_attr(a.get("time", 0)) == t and float(a.get("units", 0.0)) > 0.0:
+                                sold_pos = True
+                                break
+                    else:
+                        a = G.edges[s2, p]
+                        if a.get("rel") == "sold" and parse_time_attr(a.get("time", 0)) == t and float(a.get("units", 0.0)) > 0.0:
+                            sold_pos = True
+                if not sold_pos:
+                    negatives.append((s2, p, t))
+                    if len(negatives) >= k * 2:
+                        break
+    return negatives
 

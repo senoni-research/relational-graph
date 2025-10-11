@@ -14,7 +14,7 @@ import os
 from datetime import datetime
 
 from graph_qa.io.loader import load_graph
-from graph_qa.train.dataset import build_edge_dataset, build_time_aware_dataset
+from graph_qa.train.dataset import build_edge_dataset, build_time_aware_dataset, mine_hard_negatives_timeaware
 from graph_qa.train.model import build_model
 from graph_qa.train.model_v2 import build_enhanced_model
 from graph_qa.sampling.temporal_egonet import sample_temporal_egonet
@@ -74,6 +74,9 @@ def train_epoch(
     log_interval: int = 100,
     num_workers: int = 0,
     executor: concurrent.futures.ProcessPoolExecutor | None = None,
+    rank_loss: bool = False,
+    rank_margin: float = 0.1,
+    rank_weight: float = 0.5,
 ) -> float:
     """Train for one epoch; return average loss."""
     model.train()
@@ -86,8 +89,31 @@ def train_epoch(
     try:
         for i in range(0, len(train_data), batch_size):
             batch = train_data[i : i + batch_size]
-            batch_edges = [e for e, _ in batch]
-            batch_labels = torch.FloatTensor([lbl for _, lbl in batch]).to(device)
+            # Build balanced batch with optional hard negatives when time-aware triples are used
+            pos_edges = [e for e, y in batch if y == 1]
+            neg_edges = [e for e, y in batch if y == 0]
+            # If edges are (u,v,t) and we have positives, mine hard negatives near positives
+            batch_edges: list[Any] = []
+            batch_y: list[float] = []
+            if pos_edges and isinstance(pos_edges[0], (tuple, list)) and len(pos_edges[0]) == 3:
+                # hard-negative mining target count: 1:K per positive when rank_loss enabled else 1:1
+                target_k = 1 if not rank_loss else 2
+                hardnegs = mine_hard_negatives_timeaware(G, pos_edges, k=target_k)
+                batch_edges.extend(pos_edges)
+                batch_y.extend([1.0] * len(pos_edges))
+                # Append mined hard negatives (label 0)
+                if hardnegs:
+                    batch_edges.extend(hardnegs)
+                    batch_y.extend([0.0] * len(hardnegs))
+                # Add any prebuilt negatives to keep diversity
+                if neg_edges:
+                    batch_edges.extend(neg_edges[: max(0, len(pos_edges) * target_k - len(hardnegs))])
+                    batch_y.extend([0.0] * min(len(neg_edges), max(0, len(pos_edges) * target_k - len(hardnegs))))
+            else:
+                # Fallback: use provided edges
+                batch_edges = [e for e, _ in batch]
+                batch_y = [float(lbl) for _, lbl in batch]
+            batch_labels = torch.FloatTensor(batch_y).to(device)
 
             # Sample subgraphs and predict
             logits_list = []
@@ -103,9 +129,9 @@ def train_epoch(
                 subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
 
             for edge, sub in zip(batch_edges, subs):
-                # Model expects (u, v) pairs; drop t if present
+                # Preserve t for t-anchored temporal features
                 if isinstance(edge, (tuple, list)) and len(edge) == 3:
-                    ev = (edge[0], edge[1])
+                    ev = (edge[0], edge[1], edge[2])
                 else:
                     ev = edge
                 # Ensure minimal graph on pathological empty sample
@@ -121,6 +147,18 @@ def train_epoch(
 
             logits = torch.stack(logits_list)
             loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_labels)
+
+            # Optional pairwise ranking loss using in-batch positives and negatives
+            if rank_loss:
+                pos_idx = [i for i, (_, y) in enumerate(batch) if y == 1]
+                neg_idx = [i for i, (_, y) in enumerate(batch) if y == 0]
+                if pos_idx and neg_idx:
+                    # Simple pairing: each pos against a random neg
+                    import random as _r
+                    s_pos = logits[pos_idx]
+                    s_neg = logits[_r.choices(neg_idx, k=len(pos_idx))]
+                    rank_term = torch.log1p(torch.exp(-((s_pos - s_neg) - rank_margin))).mean()
+                    loss = loss + rank_weight * rank_term
 
             optimizer.zero_grad()
             loss.backward()
@@ -181,7 +219,7 @@ def eval_epoch(
                     subs = [sample_subgraph_for_edge(G, edge, hops=hops, K=K) for edge in batch_edges]
                 for edge, sub in zip(batch_edges, subs):
                     if isinstance(edge, (tuple, list)) and len(edge) == 3:
-                        ev = (edge[0], edge[1])
+                        ev = (edge[0], edge[1], edge[2])
                     else:
                         ev = edge
                     if sub.number_of_edges() == 0 and len(sub) == 0:
@@ -246,7 +284,13 @@ def main():
     parser.add_argument("--recency-norm", type=float, default=52.0, help="Normalization scale for recency feature (e.g., weeks)")
     parser.add_argument("--skip-hopdist", action="store_true", help="Skip hop-distance computation only (keep attention)")
     parser.add_argument("--log-interval", type=int, default=100, help="Batches between progress logs")
-    parser.add_argument("--time-aware", action="store_true", help="Use time-aware dataset with (u,v,t) and true-zero negatives")
+    parser.add_argument("--time-aware", action="store_true", help="Use time-aware dataset with (u,v,t) and inventory-aware negatives")
+    parser.add_argument("--negatives", type=str, default="inventory_only", choices=["inventory_only","all"], help="Negative policy for time-aware dataset")
+    parser.add_argument("--rank-loss", action="store_true", help="Add pairwise ranking loss (BPR-style)")
+    parser.add_argument("--rank-margin", type=float, default=0.1)
+    parser.add_argument("--rank-weight", type=float, default=0.5)
+    parser.add_argument("--event-buckets", type=str, default=None, help="Comma-separated weeks for short history features, e.g. '1,2,4,8'")
+    parser.add_argument("--rel-aware-attn", action="store_true", help="Use relation-aware attention projections")
     parser.add_argument("--num-workers", type=int, default=0, help="Parallel workers for subgraph sampling (0=off)")
     args = parser.parse_args()
 
@@ -257,7 +301,7 @@ def main():
     print("Building train/val/test splits...")
     if args.time_aware:
         train_data, val_data, test_data = build_time_aware_dataset(
-            G, train_end=args.train_end, val_end=args.val_end
+            G, train_end=args.train_end, val_end=args.val_end, negatives=args.negatives
         )
     else:
         train_data, val_data, test_data = build_edge_dataset(
@@ -276,7 +320,24 @@ def main():
     print("Building model...")
     if args.use_enhanced:
         print("  → Using enhanced model with attention and rich features")
-        model = build_enhanced_model(G, hidden_dim=args.hidden_dim, num_layers=args.num_layers, fast_mode=args.fast_mode, skip_hopdist=args.skip_hopdist, recency_feature=args.recency_feature, recency_norm=args.recency_norm)
+        # Parse event buckets
+        event_buckets = None
+        if args.event_buckets:
+            try:
+                event_buckets = [int(x.strip()) for x in args.event_buckets.split(",") if x.strip()]
+            except Exception:
+                event_buckets = None
+        model = build_enhanced_model(
+            G,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            fast_mode=args.fast_mode,
+            skip_hopdist=args.skip_hopdist,
+            recency_feature=args.recency_feature,
+            recency_norm=args.recency_norm,
+            rel_aware_attn=args.rel_aware_attn,
+            event_buckets=event_buckets,
+        )
     else:
         print("  → Using simple baseline model")
         model = build_model(G, hidden_dim=args.hidden_dim, num_layers=args.num_layers)
@@ -304,7 +365,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Epoch {epoch}/{args.epochs} starting ...")
         train_loss = train_epoch(
-            model, optimizer, G, train_data, batch_size=args.batch_size, hops=args.hops, K=args.K, device=str(device), log_interval=args.log_interval, num_workers=args.num_workers, executor=executor
+            model, optimizer, G, train_data, batch_size=args.batch_size, hops=args.hops, K=args.K, device=str(device), log_interval=args.log_interval, num_workers=args.num_workers, executor=executor, rank_loss=args.rank_loss, rank_margin=args.rank_margin, rank_weight=args.rank_weight
         )
         val_loss, val_acc = eval_epoch(model, G, val_data, batch_size=args.batch_size * 2, hops=args.hops, K=args.K, device=str(device), num_workers=max(0, args.num_workers // 2), executor=executor)
         print(f"Epoch {epoch}/{args.epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")

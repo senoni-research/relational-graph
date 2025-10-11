@@ -36,7 +36,8 @@ def load_graph(path: str, multi: bool = False) -> nx.Graph:
                     attrs = rec.get("attrs", {})
                     G.add_edge(u, v, **attrs)
                 else:
-                    raise ValueError(f"Unknown record type: {rtype}")
+                    # Ignore meta or unknown records gracefully
+                    continue
         return G
 
     # Minimal edge list fallback: 'u v' per line, no attrs

@@ -86,6 +86,12 @@ def evaluate_scorer(
     print("Evaluating on test set...")
     preds = []
     labels = []
+    slices = {
+        "seen_before": [],
+        "cold": [],
+        "inv_present": [],
+        "no_inv": [],
+    }
     empty_subgraphs = 0
 
     with torch.no_grad():
@@ -116,6 +122,37 @@ def evaluate_scorer(
             prob = 1.0 / (1.0 + pow(2.718281828, -raw_logit))
             preds.append(prob)
             labels.append(label)
+
+            # Slice bookkeeping
+            # seen-before: subgraph has pre-t edge between u,v
+            try:
+                if isinstance(edge, (tuple, list)) and len(edge) == 3:
+                    u, v, t = edge
+                else:
+                    u, v = edge
+                    t = None
+                seen = sub.has_edge(u, v)
+                (slices["seen_before"] if seen else slices["cold"]).append((prob, label))
+                # inventory-present tag: if time-aware triple and has has_inventory edge at t
+                inv = False
+                if isinstance(edge, (tuple, list)) and len(edge) == 3:
+                    if G.has_edge(u, v):
+                        if isinstance(G, type(G).to_networkx_class().__mro__[0]):
+                            inv = False
+                        # simple check across parallel edges
+                        if isinstance(G, type(G)):
+                            pass
+                    # cheap lookup by scanning neighbors (kept simple)
+                    if G.has_edge(u, v):
+                        data = G.get_edge_data(u, v)
+                        if isinstance(data, dict):
+                            for d in data.values():
+                                if d.get("rel") == "has_inventory" and str(d.get("time")) == str(t):
+                                    inv = True
+                                    break
+                (slices["inv_present"] if inv else slices["no_inv"]).append((prob, label))
+            except Exception:
+                pass
 
     # Apply optional calibrator
     if calibrator_path:
@@ -153,6 +190,21 @@ def evaluate_scorer(
     ap = average_precision_score(labels, preds)
     print(f"  AUC: {auc:.4f}")
     print(f"  AP:  {ap:.4f}")
+
+    # Slice metrics (best-effort)
+    try:
+        def _score(pairs):
+            if not pairs:
+                return None, None
+            ps, ys = zip(*pairs)
+            from sklearn.metrics import roc_auc_score, average_precision_score
+            return roc_auc_score(ys, ps), average_precision_score(ys, ps)
+        for name in ("seen_before","cold","inv_present","no_inv"):
+            auc_s, ap_s = _score(slices[name])
+            if auc_s is not None:
+                print(f"  [{name}] AUC {auc_s:.4f}, AP {ap_s:.4f} ({len(slices[name])} samples)")
+    except Exception:
+        pass
     
     # Show a few predictions
     print("\nSample predictions:")
