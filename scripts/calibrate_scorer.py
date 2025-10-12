@@ -62,6 +62,8 @@ def main():
             num_layers=ckpt["num_layers"],
             recency_feature=ckpt.get("recency_feature", False),
             recency_norm=ckpt.get("recency_norm", 52.0),
+            rel_aware_attn=ckpt.get("rel_aware_attn", False),
+            event_buckets=ckpt.get("event_buckets", None),
         )
         model.fast_mode = ckpt.get("fast_mode", False)
         model.skip_hopdist = ckpt.get("skip_hopdist", False)

@@ -62,6 +62,8 @@ def evaluate_scorer(
             num_layers=ckpt["num_layers"],
             recency_feature=ckpt.get("recency_feature", False),
             recency_norm=ckpt.get("recency_norm", 52.0),
+            rel_aware_attn=ckpt.get("rel_aware_attn", False),
+            event_buckets=ckpt.get("event_buckets", None),
         )
         # Align runtime flags with training if present
         if "fast_mode" in ckpt:
@@ -76,7 +78,8 @@ def evaluate_scorer(
             num_layers=ckpt["num_layers"],
         )
     
-    model.load_state_dict(ckpt["model_state"])
+    # Be tolerant to minor layer diffs across checkpoints
+    model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
 
     # Use training hparams if provided
