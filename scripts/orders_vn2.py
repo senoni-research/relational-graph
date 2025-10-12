@@ -57,12 +57,14 @@ def build_model_from_ckpt(G: nx.Graph, ckpt_path: str) -> torch.nn.Module:
     is_enhanced = "model_state" in ckpt and any(k.startswith("cat_embeds.") for k in ckpt["model_state"].keys())
     if is_enhanced:
         model = EnhancedEdgeScorer(
-            node_types=ckpt["node_types"],
+            node_types=ckpt.get("node_types"),
             categorical_attrs=ckpt.get("categorical_attrs", {}),
             hidden_dim=ckpt.get("hidden_dim", 64),
             num_layers=ckpt.get("num_layers", 3),
             recency_feature=ckpt.get("recency_feature", False),
             recency_norm=ckpt.get("recency_norm", 52.0),
+            rel_aware_attn=ckpt.get("rel_aware_attn", False),
+            event_buckets=ckpt.get("event_buckets", None),
         )
         model.fast_mode = ckpt.get("fast_mode", False)
         model.skip_hopdist = ckpt.get("skip_hopdist", False)
