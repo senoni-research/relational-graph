@@ -55,6 +55,9 @@ def evaluate_scorer(
                     vocab_size = ckpt["model_state"][key].shape[0] - 1
                     cat_attrs[attr_name] = list(range(vocab_size))
         
+        # Collect ID vocab for optional ID embeddings to match training
+        store_ids = [str(n).replace("store:", "") for n, a in G.nodes(data=True) if str(a.get("type")) == "store"]
+        product_ids = [str(n).replace("product:", "") for n, a in G.nodes(data=True) if str(a.get("type")) == "product"]
         model = EnhancedEdgeScorer(
             node_types=ckpt["node_types"],
             categorical_attrs=cat_attrs,
@@ -64,6 +67,9 @@ def evaluate_scorer(
             recency_norm=ckpt.get("recency_norm", 52.0),
             rel_aware_attn=ckpt.get("rel_aware_attn", False),
             event_buckets=ckpt.get("event_buckets", None),
+            store_ids=store_ids,
+            product_ids=product_ids,
+            id_emb_dim=ckpt.get("id_emb_dim", 16),
         )
         # Align runtime flags with training if present
         if "fast_mode" in ckpt:
