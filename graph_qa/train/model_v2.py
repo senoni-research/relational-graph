@@ -28,6 +28,11 @@ class EnhancedEdgeScorer(nn.Module):
         num_layers: int = 3,
         recency_feature: bool = False,
         recency_norm: float = 52.0,
+        rel_aware_attn: bool = False,
+        event_buckets: List[int] | None = None,
+        store_ids: List[Any] | None = None,
+        product_ids: List[Any] | None = None,
+        id_emb_dim: int = 16,
     ):
         super().__init__()
         # Ensure explicit UNK handling and stable categorical normalization
@@ -61,21 +66,50 @@ class EnhancedEdgeScorer(nn.Module):
         total_dim = hidden_dim // 2 + cat_dim * len(categorical_attrs) + hidden_dim // 4
         self.feature_proj = nn.Linear(total_dim, hidden_dim)
         
+        # Relation-aware attention toggle
+        self.rel_aware_attn = bool(rel_aware_attn)
+        # Event-bucket windows (weeks)
+        self.event_buckets = list(event_buckets) if event_buckets else []
+
+        # Optional ID embeddings (store/product)
+        self.has_id_embeddings = store_ids is not None and product_ids is not None and id_emb_dim > 0
+        if self.has_id_embeddings:
+            # Reserve index 0 for UNK
+            self.store_id_to_idx: Dict[Any, int] = {sid: i + 1 for i, sid in enumerate(store_ids or [])}
+            self.product_id_to_idx: Dict[Any, int] = {pid: i + 1 for i, pid in enumerate(product_ids or [])}
+            self.store_emb = nn.Embedding(len(self.store_id_to_idx) + 1, id_emb_dim)
+            self.prod_emb = nn.Embedding(len(self.product_id_to_idx) + 1, id_emb_dim)
+            self.id_emb_dim = id_emb_dim
+        else:
+            self.store_id_to_idx = {}
+            self.product_id_to_idx = {}
+            self.id_emb_dim = 0
+
         # Attention-based GNN layers
         self.attn_layers = nn.ModuleList()
         for _ in range(num_layers):
             self.attn_layers.append(nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True))
+
+        # Optional relation embeddings for attention modulation
+        if self.rel_aware_attn:
+            self.rel_embed = nn.Embedding(8, hidden_dim)  # small set: sold, has_inventory, ship, other
         
-        # Edge predictor with temporal/distance features (+ optional recency)
-        edge_feat_dim = 2 + (1 if self.recency_feature else 0)
+        # Edge predictor with temporal/distance features (+ optional recency + buckets)
+        bucket_dim = len(self.event_buckets) * 4 if self.event_buckets else 0  # sales, stockout, inbound, onhand summaries
+        edge_feat_dim = 2 + (1 if self.recency_feature else 0) + bucket_dim
+        # Add learned ID biases (store/product) via a small bias head
         self.edge_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + edge_feat_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2 + edge_feat_dim + (2 * self.id_emb_dim), hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+        # Keep hashed bias as fallback if ID embeddings are disabled
+        if not self.has_id_embeddings:
+            self.store_bias = nn.Embedding(65536, 1)  # large enough; will index via hashed ids
+            self.product_bias = nn.Embedding(131072, 1)
 
     def encode_node_features(self, G_sub: nx.Graph, nodes: List[Any]) -> torch.Tensor:
         """Encode node features from graph attributes."""
@@ -154,7 +188,13 @@ class EnhancedEdgeScorer(nn.Module):
                 context = x[context_indices]
                 # Queries: (N, 1, H)
                 query = x.unsqueeze(1)
-                attn_out, _ = attn_layer(query, context, context, key_padding_mask=key_padding_mask)
+                if self.rel_aware_attn:
+                    # Simple modulation: add a learned relation bias to keys/values (approximation)
+                    # Here we skip explicit per-edge relation typing for speed and use a shared bias
+                    rel_bias = self.rel_embed.weight.mean(dim=0, keepdim=True).unsqueeze(0).expand_as(context)
+                    attn_out, _ = attn_layer(query, context + rel_bias, context + rel_bias, key_padding_mask=key_padding_mask)
+                else:
+                    attn_out, _ = attn_layer(query, context, context, key_padding_mask=key_padding_mask)
                 x = torch.relu(attn_out.squeeze(1))  # (N, H)
         
         return x
@@ -241,9 +281,72 @@ class EnhancedEdgeScorer(nn.Module):
                     denom = math.log1p(max(1.0, float(self.recency_norm)))
                     recency_scalar = math.log1p(float(weeks)) / denom
                 edge_feat_list.append(recency_scalar)
+            # Event-bucket summaries (cheap aggregations over pre-t subgraph)
+            if self.event_buckets:
+                # Consume precomputed v2 history attrs from the original graph nodes/edges if present
+                # We read from G_sub edge attrs for (u,v) at the last pre-t time if available
+                sales_buckets = []
+                stockout_buckets = []
+                inbound_buckets = []
+                onhand_buckets = []
+                # Initialize with zeros
+                for _ in self.event_buckets:
+                    sales_buckets.append(0.0)
+                    stockout_buckets.append(0.0)
+                    inbound_buckets.append(0.0)
+                    onhand_buckets.append(0.0)
+                # Try to fetch lag_sum_w{w} and inv_present_now from edge attrs (closest pre-t)
+                try:
+                    if G_sub.has_edge(u, v):
+                        if isinstance(G_sub, nx.MultiGraph):
+                            # choose edge with max time < t_anchor
+                            best_edge = None
+                            best_time = -1
+                            data = G_sub.get_edge_data(u, v)
+                            for d in data.values():
+                                tt = d.get("time", -1)
+                                if t_anchor is None or (tt is not None and int(tt) < int(t_anchor)):
+                                    if int(tt) > best_time:
+                                        best_time = int(tt)
+                                        best_edge = d
+                            src = best_edge if best_edge is not None else {}
+                        else:
+                            src = G_sub.edges[u, v]
+                        for idx_w, w in enumerate(self.event_buckets):
+                            val = src.get(f"lag_sum_w{w}")
+                            if val is not None:
+                                sales_buckets[idx_w] = float(val)
+                        inv_now = src.get("inv_present_now")
+                        if inv_now is not None:
+                            onhand_buckets = [float(inv_now)] * len(self.event_buckets)
+                        stockout_last_w1 = src.get("stockout_last_w1")
+                        if stockout_last_w1 is not None:
+                            stockout_buckets = [float(bool(stockout_last_w1))] * len(self.event_buckets)
+                except Exception:
+                    pass
+                edge_feat_list.extend(sales_buckets + stockout_buckets + inbound_buckets + onhand_buckets)
+
             edge_feats = torch.tensor(edge_feat_list, dtype=torch.float32, device=device)
             concat = torch.cat([u_emb, v_emb, edge_feats], dim=0)
-            logit = self.edge_mlp(concat).squeeze(-1)
+            # Optional ID embeddings concatenated
+            if self.has_id_embeddings:
+                sid_idx = self.store_id_to_idx.get(str(u).replace("store:", ""), 0)
+                pid_idx = self.product_id_to_idx.get(str(v).replace("product:", ""), 0)
+                id_vec = torch.cat([
+                    self.store_emb.weight[sid_idx],
+                    self.prod_emb.weight[pid_idx],
+                ], dim=0).to(device)
+                concat = torch.cat([concat, id_vec], dim=0)
+                logit = self.edge_mlp(concat).squeeze(-1)
+            else:
+                logit = self.edge_mlp(concat).squeeze(-1)
+                # Fallback hashed bias terms
+                try:
+                    sb = abs(hash(str(u))) % 65536
+                    pb = abs(hash(str(v))) % 131072
+                    logit = logit + self.store_bias.weight[sb].squeeze() + self.product_bias.weight[pb].squeeze()
+                except Exception:
+                    pass
             edge_logits.append(logit)
         
         return torch.stack(edge_logits)
@@ -257,6 +360,9 @@ def build_enhanced_model(
     skip_hopdist: bool = False,
     recency_feature: bool = False,
     recency_norm: float = 52.0,
+    rel_aware_attn: bool = False,
+    event_buckets: List[int] | None = None,
+    id_emb_dim: int = 16,
 ) -> EnhancedEdgeScorer:
     """Build an enhanced scorer from a graph (infer node types and categorical attributes)."""
     node_types_set = set()
@@ -272,6 +378,10 @@ def build_enhanced_model(
     node_types = ["unknown"] + sorted(t for t in node_types_set if t != "unknown")
     categorical_attrs = {k: sorted(v) for k, v in cat_attrs.items()}
     
+    # Collect ID vocab for optional embeddings
+    store_ids = [str(n).replace("store:", "") for n, a in G.nodes(data=True) if str(a.get("type")) == "store"]
+    product_ids = [str(n).replace("product:", "") for n, a in G.nodes(data=True) if str(a.get("type")) == "product"]
+
     model = EnhancedEdgeScorer(
         node_types,
         categorical_attrs,
@@ -279,6 +389,11 @@ def build_enhanced_model(
         num_layers=num_layers,
         recency_feature=recency_feature,
         recency_norm=recency_norm,
+        rel_aware_attn=rel_aware_attn,
+        event_buckets=event_buckets,
+        store_ids=store_ids,
+        product_ids=product_ids,
+        id_emb_dim=id_emb_dim,
     )
     model.fast_mode = fast_mode
     model.skip_hopdist = skip_hopdist

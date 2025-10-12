@@ -55,6 +55,9 @@ def main():
     ckpt = torch.load(args.ckpt, map_location="cpu")
     is_enhanced = "model_state" in ckpt and any(k.startswith("cat_embeds.") for k in ckpt["model_state"].keys())
     if is_enhanced:
+        # Match training feature config (including optional ID embeddings)
+        store_ids = [str(n).replace("store:", "") for n, a in G.nodes(data=True) if str(a.get("type")) == "store"]
+        product_ids = [str(n).replace("product:", "") for n, a in G.nodes(data=True) if str(a.get("type")) == "product"]
         model = EnhancedEdgeScorer(
             node_types=ckpt["node_types"],
             categorical_attrs=ckpt.get("categorical_attrs", {}),
@@ -62,6 +65,11 @@ def main():
             num_layers=ckpt["num_layers"],
             recency_feature=ckpt.get("recency_feature", False),
             recency_norm=ckpt.get("recency_norm", 52.0),
+            rel_aware_attn=ckpt.get("rel_aware_attn", False),
+            event_buckets=ckpt.get("event_buckets", None),
+            store_ids=store_ids,
+            product_ids=product_ids,
+            id_emb_dim=ckpt.get("id_emb_dim", 16),
         )
         model.fast_mode = ckpt.get("fast_mode", False)
         model.skip_hopdist = ckpt.get("skip_hopdist", False)

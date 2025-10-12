@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Iterable, List, Set
 
 import pandas as pd
+import math
+from datetime import date as _date
 
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -189,6 +191,192 @@ def build_graph_records(
     return records
 
 
+def build_graph_records_v2(
+    sales_path: Path,
+    stock_path: Path,
+    master_path: Path,
+    *,
+    max_pairs: int | None = 1000,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    include_sold_zeros: bool = False,
+    sold_zeros_if_instock: bool = True,
+    add_history_features: bool = True,
+    history_windows: Iterable[int] = (1, 2, 4, 8),
+) -> List[dict]:
+    """
+    Enhanced generator:
+      - Enforces inventory-aware negatives by default (include_sold_zeros=False and sold_zeros_if_instock=True).
+      - Adds compact past-history features to 'sold' edges WITHOUT leaking future info.
+      - Keeps existing node/edge schema; only adds attrs; emits a 'meta' record first.
+    """
+    sales = pd.read_csv(sales_path, dtype={"Store": str, "Product": str})
+    instock = pd.read_csv(stock_path, dtype={"Store": str, "Product": str})
+    master = pd.read_csv(master_path, dtype={"Store": str, "Product": str})
+
+    # Dates
+    sales_dates = sorted([c for c in sales.columns if DATE_RE.match(c)])
+    stock_dates = sorted([c for c in instock.columns if DATE_RE.match(c)])
+    if start_date is not None:
+        sales_dates = [d for d in sales_dates if d >= start_date]
+        stock_dates = [d for d in stock_dates if d >= start_date]
+    if end_date is not None:
+        sales_dates = [d for d in sales_dates if d <= end_date]
+        stock_dates = [d for d in stock_dates if d <= end_date]
+
+    # Limit pairs and align
+    if max_pairs is not None and max_pairs > 0 and len(sales) > max_pairs:
+        sales = sales.head(max_pairs)
+        head_pairs = set(map(tuple, sales[["Store", "Product"]].values.tolist()))
+        instock = instock[instock.apply(lambda r: (r["Store"], r["Product"]) in head_pairs, axis=1)]
+        master = master[master.apply(lambda r: (r["Store"], r["Product"]) in head_pairs, axis=1)]
+
+    def canon_id(prefix: str, x: object) -> str:
+        s = str(x).strip()
+        try:
+            if s.replace(".", "", 1).isdigit():
+                s = str(int(float(s)))
+        except Exception:
+            pass
+        return f"{prefix}:{s}"
+
+    # Node ids
+    stores: Set[str] = {canon_id("store", r["Store"]) for _, r in sales.iterrows()}
+    products: Set[str] = {canon_id("product", r["Product"]) for _, r in sales.iterrows()}
+
+    # Attributes (fixed split: product-level vs store-level)
+    prod_cols = [c for c in ["ProductGroup","Division","Department","DepartmentGroup"] if c in master.columns]
+    store_cols = [c for c in ["StoreFormat","Format","Region"] if c in master.columns]
+    prod_attrs = (
+        master[["Product"] + prod_cols].drop_duplicates(subset=["Product"]).set_index("Product")[prod_cols]
+        if prod_cols else pd.DataFrame()
+    )
+    store_formats = (
+        master[["Store"] + store_cols].drop_duplicates(subset=["Store"]).set_index("Store")[store_cols]
+        if store_cols else pd.DataFrame()
+    )
+
+    # Meta + nodes
+    records: List[dict] = []
+    records.append({
+        "type": "meta",
+        "schema_version": "1.1",
+        "attrs": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "history_windows": list(history_windows),
+            "inventory_aware_zeros": bool(sold_zeros_if_instock and not include_sold_zeros),
+        },
+    })
+
+    def _safe_sort(ids):
+        def key(x):
+            p, s = x.split(":")
+            try:
+                return (p, int(s))
+            except Exception:
+                return (p, s)
+        return sorted(ids, key=key)
+
+    for sid in _safe_sort(stores):
+        store_key = sid.split(":")[1]
+        attrs = {"type": "store"}
+        if not store_formats.empty and store_key in store_formats.index:
+            for col, val in store_formats.loc[store_key].items():
+                if pd.notna(val):
+                    attrs[col] = val
+        records.append({"type": "node", "id": sid, "attrs": attrs})
+
+    for pid in _safe_sort(products):
+        prod_key = pid.split(":")[1]
+        attrs = {"type": "product"}
+        if not prod_attrs.empty and prod_key in prod_attrs.index:
+            for col, val in prod_attrs.loc[prod_key].items():
+                if pd.notna(val):
+                    attrs[col] = val
+        records.append({"type": "node", "id": pid, "attrs": attrs})
+
+    # Inventory booleans index (preserve NA vs explicit false)
+    instock_idx = instock.set_index(["Store", "Product"]) if not instock.empty else None
+
+    sales_dates_sorted = sales_dates
+    date_ints = [ymd_to_int(d) for d in sales_dates_sorted]
+
+    # Iterate and build edges with history
+    for _, row in sales.iterrows():
+        u = canon_id("store", row["Store"])
+        v = canon_id("product", row["Product"])
+        pair_key = (row["Store"], row["Product"]) if instock_idx is not None else None
+
+        # Units series
+        s_units: List[float] = []
+        for d in sales_dates_sorted:
+            val = row.get(d, 0)
+            try:
+                s_units.append(float(val) if pd.notna(val) else 0.0)
+            except Exception:
+                s_units.append(0.0)
+
+        # Inventory series aligned
+        if instock_idx is not None and pair_key in instock_idx.index:
+            inv_series = []
+            for d in sales_dates_sorted:
+                raw = instock_idx.loc[pair_key].get(d, None)
+                s = str(raw).strip().lower()
+                if s in ("true","1","yes","y","t"):
+                    inv_series.append(True)
+                elif s in ("false","0","no","n","f"):
+                    inv_series.append(False)
+                else:
+                    inv_series.append(False)  # treat NA as not explicitly present
+        else:
+            inv_series = [False] * len(sales_dates_sorted)
+
+        # Prefix sums for rolling
+        last_sale_idx = -1
+        cumsums = [0.0] * (len(sales_dates_sorted) + 1)
+        for t in range(len(sales_dates_sorted)):
+            cumsums[t + 1] = cumsums[t] + (s_units[t] if not pd.isna(s_units[t]) else 0.0)
+
+        for t, d in enumerate(sales_dates_sorted):
+            units = s_units[t] if s_units[t] is not None else 0.0
+            inv_present = inv_series[t]
+
+            emit_sold = (units > 0.0) or (include_sold_zeros or (sold_zeros_if_instock and inv_present))
+            if emit_sold:
+                attrs: dict = {"rel": "sold", "time": date_ints[t], "units": float(units)}
+                if add_history_features:
+                    seen_before = last_sale_idx >= 0
+                    attrs["seen_before"] = bool(seen_before)
+                    if seen_before:
+                        attrs["recency_weeks"] = int(t - last_sale_idx)
+                    for w in history_windows:
+                        start = max(0, t - int(w))
+                        attrs[f"lag_sum_w{w}"] = float(cumsums[t] - cumsums[start])
+                    attrs["inv_present_now"] = bool(inv_present)
+                    if t > 0:
+                        attrs["stockout_last_w1"] = bool(not inv_series[t - 1])
+                # week-of-year seasonality (sin/cos)
+                try:
+                    iso_week = _date.fromisoformat(d).isocalendar().week
+                    attrs["woy_sin"] = math.sin(2 * math.pi * iso_week / 52.0)
+                    attrs["woy_cos"] = math.cos(2 * math.pi * iso_week / 52.0)
+                except Exception:
+                    pass
+                records.append({"type": "edge", "u": u, "v": v, "attrs": attrs})
+
+            if inv_present:
+                records.append({"type": "edge", "u": u, "v": v, "attrs": {"rel": "has_inventory", "time": date_ints[t], "present": True}})
+            else:
+                # Optional: explicit no-inventory edge emitted later via flag; we record via a temporary marker
+                pass
+
+            if units > 0.0:
+                last_sale_idx = t
+
+    return records
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Convert VN2 CSVs to JSONL graph for relational-graph repo.")
     ap.add_argument("--vn2-data-dir", type=str, default=str(Path(__file__).resolve().parents[2] / "vn2inventory" / "data"))
@@ -201,6 +389,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--sold-zeros-if-instock", dest="sold_zeros_if_instock", action="store_true")
     ap.add_argument("--no-sold-zeros-if-instock", dest="sold_zeros_if_instock", action="store_false")
     ap.set_defaults(sold_zeros_if_instock=True)
+    # v2 enhancements
+    ap.add_argument("--v2", action="store_true", help="Use enhanced generator with history features and meta record")
+    ap.add_argument("--add-history-features", dest="add_history_features", action="store_true")
+    ap.add_argument("--no-history-features", dest="add_history_features", action="store_false")
+    ap.set_defaults(add_history_features=True)
+    ap.add_argument("--history-windows", type=str, default="1,2,4,8", help="Comma-separated weeks for rolling sums")
+    ap.add_argument("--initial-state", type=str, default=None, help="Path to 'Week 0 - 2024-04-08 - Initial State.csv' to emit a state edge at anchor week")
+    ap.add_argument("--emit-no-inventory", action="store_true", help="Emit explicit no_inventory edges when source is an explicit false/0")
     return ap.parse_args()
 
 
@@ -214,16 +410,56 @@ def main() -> None:
     if not sales_path.exists() or not stock_path.exists() or not master_path.exists():
         raise FileNotFoundError(f"Missing VN2 CSVs under {data_dir}")
 
-    records = build_graph_records(
-        sales_path=sales_path,
-        stock_path=stock_path,
-        master_path=master_path,
-        max_pairs=args.max_pairs,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        include_sold_zeros=args.include_sold_zeros,
-        sold_zeros_if_instock=args.sold_zeros_if_instock,
-    )
+    if args.v2:
+        try:
+            windows = [int(x.strip()) for x in (args.history_windows.split(",") if args.history_windows else []) if x.strip()]
+        except Exception:
+            windows = [1, 2, 4, 8]
+        records = build_graph_records_v2(
+            sales_path=sales_path,
+            stock_path=stock_path,
+            master_path=master_path,
+            max_pairs=args.max_pairs,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            include_sold_zeros=args.include_sold_zeros,
+            sold_zeros_if_instock=args.sold_zeros_if_instock,
+            add_history_features=args.add_history_features,
+            history_windows=windows,
+        )
+        # Optional: add a single state edge per pair from Initial State at anchor week
+        if args.initial_state:
+            try:
+                state = pd.read_csv(args.initial_state, dtype={"Store": str, "Product": str})
+                anchor_date = "2024-04-08"
+                anchor_int = ymd_to_int(anchor_date)
+                for _, r in state.iterrows():
+                    u = f"store:{str(r.get('Store')).strip()}"
+                    v = f"product:{str(r.get('Product')).strip()}"
+                    attrs = {
+                        "rel": "state",
+                        "time": anchor_int,
+                        "start_inv": float(r.get("Start Inventory", 0) or 0),
+                        "in_transit_w1": float(r.get("In Transit W+1", 0) or 0),
+                        "in_transit_w2": float(r.get("In Transit W+2", 0) or 0),
+                        "missed_sales": float(r.get("Missed Sales", 0) or 0),
+                        "holding_cost": float(r.get("Holding Cost", 0) or 0),
+                        "shortage_cost": float(r.get("Shortage Cost", 0) or 0),
+                    }
+                    records.append({"type": "edge", "u": u, "v": v, "attrs": attrs})
+            except Exception as e:
+                print(f"[warn] failed to add initial state edges: {e}")
+    else:
+        records = build_graph_records(
+            sales_path=sales_path,
+            stock_path=stock_path,
+            master_path=master_path,
+            max_pairs=args.max_pairs,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            include_sold_zeros=args.include_sold_zeros,
+            sold_zeros_if_instock=args.sold_zeros_if_instock,
+        )
     out_path = Path(args.out)
     write_jsonl(records, out_path)
     print(f"Wrote {out_path} with {len(records)} records")

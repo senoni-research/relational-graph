@@ -82,27 +82,23 @@ def sample_temporal_egonet(
                 q.append((nbr, d + 1))
 
     # Build induced subgraph on visited nodes with temporal edge filter
-    H = nx.Graph()
+    # Keep MultiGraph to preserve multiple events; iterate edges once to avoid duplication
+    H = nx.MultiGraph()
     for n in visited:
         H.add_node(n, **G.nodes[n])
 
-    for u in H.nodes:
-        for v in G.neighbors(u):
-            if v in H and _edge_time(G, u, v) < anchor_time:
-                # For MultiGraph, copy the earliest edge; for Graph, copy the single edge
-                if isinstance(G, nx.MultiGraph):
-                    # Find earliest edge key
-                    earliest_key = None
-                    earliest_time = float("inf")
-                    for key in G[u][v]:
-                        t = G[u][v][key].get("time", float("inf"))
-                        if t < earliest_time:
-                            earliest_time = t
-                            earliest_key = key
-                    if earliest_key is not None:
-                        H.add_edge(u, v, **G[u][v][earliest_key])
-                else:
-                    H.add_edge(u, v, **G.edges[u, v])
+    if isinstance(G, nx.MultiGraph):
+        for u, v, key, attrs in G.edges(keys=True, data=True):
+            if u in visited and v in visited:
+                t = attrs.get("time", float("inf"))
+                if t < anchor_time:
+                    H.add_edge(u, v, **attrs)
+    else:
+        for u, v, attrs in G.edges(data=True):
+            if u in visited and v in visited:
+                t = attrs.get("time", float("inf"))
+                if t < anchor_time:
+                    H.add_edge(u, v, **attrs)
 
     if H.number_of_nodes() <= K:
         return H
