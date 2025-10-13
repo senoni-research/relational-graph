@@ -154,6 +154,17 @@ def _expected_cost(mu_H: np.ndarray, sigma_H: np.ndarray, S: np.ndarray, cost_sh
     CoH = float(cost_holding_per_week) * float(horizon)
     return float(np.sum(Cu * under + CoH * over))
 
+def _expected_cost_over_df(df: pd.DataFrame, q: np.ndarray, cost_shortage: float, cost_holding_per_week: float, horizon: int) -> float:
+    # Build arrays; tolerate missing onhand/onorder by using zeros
+    mu_H_arr = pd.to_numeric(df.get("mu_H", 0.0), errors="coerce").fillna(0.0).to_numpy()
+    sigma_H_arr = pd.to_numeric(df.get("sigma_H", 1e-6), errors="coerce").fillna(1e-6).to_numpy()
+    onhand_series = df["onhand"] if "onhand" in df.columns else pd.Series(0.0, index=df.index)
+    onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
+    onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
+    onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
+    S = onhand + onorder + np.asarray(q, dtype=float)
+    return _expected_cost(mu_H_arr, sigma_H_arr, S, cost_shortage, cost_holding_per_week, horizon)
+
 # Fast inverse normal CDF approximation (Abramowitz-Stegun style)
 def inv_norm_cdf(p: float) -> float:
     p = float(max(1e-12, min(1-1e-12, p)))
@@ -198,6 +209,44 @@ def inv_norm_cdf(p: float) -> float:
         (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1)
     )
 
+def _p_active_from_weeks(p_weeks: list[float]) -> float:
+    prod_inactive = 1.0
+    for pw in p_weeks:
+        prod_inactive *= max(0.0, min(1.0, float(pw)))
+    return 1.0 - prod_inactive
+
+def _expected_cost_mixture(S: float, p_active: float, mu_pos: float, sigma_pos: float, cost_shortage: float, cost_holding_per_week: float, horizon: int) -> float:
+    # Mixture: (1-p) * delta0 + p * N(mu_pos, sigma_pos^2)
+    # Expected shortage/overage at stock level S
+    p = max(0.0, min(1.0, float(p_active)))
+    sigma = max(1e-8, float(sigma_pos))
+    mu = float(mu_pos)
+    z = (S - mu) / sigma
+    # Normal parts
+    phi = math.exp(-0.5 * z * z) / SQRT2PI
+    # Use math.erf for Phi
+    Phi = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    e_short_pos = sigma * phi + (mu - S) * (1.0 - Phi)
+    e_over_pos  = sigma * phi + (S - mu) * Phi
+    # Mixture expectations
+    e_short = p * e_short_pos
+    e_over  = (1.0 - p) * max(0.0, S) + p * e_over_pos
+    Cu = float(cost_shortage)
+    CoH = float(cost_holding_per_week) * float(horizon)
+    return Cu * e_short + CoH * e_over
+
+def _mixture_base_stock(p_active: float, mu_pos: float, sigma_pos: float, cost_shortage: float, cost_holding_per_week: float, horizon: int) -> float:
+    # Newsvendor on mixture: order 0 if p <= 1-beta; else quantile within positive component at u = (beta - (1-p))/p
+    p = max(0.0, min(1.0, float(p_active)))
+    # Convert costs to horizon-equivalent beta
+    beta = float(cost_shortage) / (float(cost_shortage) + float(cost_holding_per_week) * float(horizon))
+    if p <= max(0.0, 1.0 - beta):
+        return 0.0
+    u = (beta - (1.0 - p)) / max(p, 1e-8)
+    u = min(max(u, 1e-6), 1.0 - 1e-6)
+    z = inv_norm_cdf(u)
+    return float(max(0.0, float(mu_pos) + float(sigma_pos) * z))
+
 def _sanity_print(submissions: list[dict], hb_map: Dict[Tuple[str,str], int], k: int = 50) -> None:
     try:
         p_arr = np.array([float(s.get("p_t3", 0.0)) for s in submissions])
@@ -206,7 +255,7 @@ def _sanity_print(submissions: list[dict], hb_map: Dict[Tuple[str,str], int], k:
         top_idx = np.argsort(-p_arr)[:k]
         bot_idx = np.argsort(p_arr)[:k]
         top_keep = float((bl_arr[top_idx] >= hb_arr[top_idx]).mean()) if len(top_idx) else 0.0
-        bot_shrink = float((bl_arr[bot_idx] <= hb_arr[bot_idx]).mean()) if len(bot_idx) else 0.0
+        bot_shrink = float((bl_arr[bot_idx] < hb_arr[bot_idx]).mean()) if len(bot_idx) else 0.0
         print(f"Sanity: top-{k} keep-rate={top_keep:.2f}, bottom-{k} shrink-rate={bot_shrink:.2f}")
     except Exception as e:
         print(f"[warn] sanity calc failed: {e}")
@@ -271,11 +320,22 @@ def main():
     ap.add_argument("--submit", default=None, type=str, help="If provided, write 599-row orders.csv here with order_qty column")
     ap.add_argument("--beta", default=0.833, type=float, help="Critical fractile (default 1/(1+0.2))")
     ap.add_argument("--features-599", default=None, type=str, help="If provided, write 599-row features aligned to index (includes p_t1..p_t3)")
-    ap.add_argument("--blend", default="none", choices=["none","hb","graph","gated","shrink","cap"], help="Blend submission strategy")
+    ap.add_argument("--blend", default="none", choices=["none","hb","graph","gated","gated2","shrink","cap","mixture","mixture_min"], help="Blend submission strategy")
     ap.add_argument("--hb", default=None, type=str, help="Path to HB submission CSV (store_id,product_id,order_qty)")
     ap.add_argument("--tau", default=0.6, type=float, help="Gating threshold on p_t3 for blend=gated")
     ap.add_argument("--alpha", default=0.3, type=float, help="Shrink factor on HB when p<tau for blend=gated")
     ap.add_argument("--submit-blended", default=None, type=str, help="Path to write blended submission (599 rows)")
+    # Mixture policy options
+    ap.add_argument("--cost-shortage-mixture", type=float, default=None, help="Override shortage cost per unit for mixture policy (defaults to --cost-shortage)")
+    ap.add_argument("--cost-holding-mixture", type=float, default=None, help="Override holding cost per unit per week for mixture policy (defaults to --cost-holding)")
+    # Two-sided gating + ABC flags
+    ap.add_argument("--tau-hi", type=float, default=None, help="High-probability threshold for two-sided gate (gated2)")
+    ap.add_argument("--tau-lo", type=float, default=None, help="Low-probability threshold for two-sided gate (gated2)")
+    ap.add_argument("--tau-margin", type=float, default=0.10, help="If --tau-lo is not set, use tau_hi - tau_margin")
+    ap.add_argument("--abc-quantiles", type=str, default="0.6,0.9", help="Quantiles for A/B/C split on mu_H (e.g., '0.6,0.9')")
+    ap.add_argument("--beta-a", type=float, default=0.88, help="Service level beta for A class")
+    ap.add_argument("--beta-b", type=float, default=0.80, help="Service level beta for B class")
+    ap.add_argument("--beta-c", type=float, default=0.70, help="Service level beta for C class")
     # Grid and cost-sim flags
     ap.add_argument("--grid", action="store_true", help="Run tau/alpha grid and pick best by expected cost or sanity score")
     ap.add_argument("--tau-grid", type=str, default=None, help="Comma-separated tau grid, e.g. '0.50,0.55,0.60'")
@@ -399,8 +459,8 @@ def main():
                 count += 1
         print(f"Wrote {count} feature rows to {args.features_599}")
 
-    # === τ/α grid (if requested) ===
-    if args.grid:
+    # === τ/α grid (if requested) — skip for gated2 (two-sided policy has its own grid) ===
+    if args.grid and args.blend != "gated2":
         if not args.hb:
             raise SystemExit("--grid requires --hb")
         if not args.features_599:
@@ -496,6 +556,102 @@ def main():
             except Exception as e:
                 print(f"[warn] sanity calc failed: {e}")
 
+    # === Two-sided gated policy (gated2) ===
+    if args.submission_index and args.blend == "gated2":
+        # Build df from features and, if available, state and HB
+        feat = pd.read_csv(args.features_599) if args.features_599 else None
+        if feat is None:
+            # Construct features from in-memory rows
+            feat = pd.DataFrame(rows)
+            if args.submission_index:
+                idx = pd.read_csv(args.submission_index)
+                feat = idx.merge(feat, on=["store_id","product_id"], how="left")
+        hb = pd.read_csv(args.hb) if args.hb else pd.DataFrame(columns=["store_id","product_id"]) 
+        for d in (feat, hb):
+            if len(d.columns) == 0:
+                continue
+            cols = {c.lower(): c for c in d.columns}
+            sid = cols.get("store_id", list(d.columns)[0])
+            pid = cols.get("product_id", list(d.columns)[1] if len(d.columns) > 1 else list(d.columns)[0])
+            d.rename(columns={sid:"store_id", pid:"product_id"}, inplace=True)
+            d["store_id"] = d["store_id"].astype(str)
+            d["product_id"] = d["product_id"].astype(str)
+        # pick HB qty col
+        hb_qty_col = next((c for c in hb.columns if c.lower() in {"order_qty","orders","qty","0"}), (hb.columns[-1] if len(hb.columns) else None))
+        df = feat.merge(hb[["store_id","product_id", hb_qty_col]] if hb_qty_col else hb, on=["store_id","product_id"], how="left")
+        hbq = pd.to_numeric(df[hb_qty_col], errors="coerce").fillna(0).to_numpy().astype(int) if hb_qty_col else np.zeros(len(df), dtype=int)
+        # probabilities
+        p = pd.to_numeric(df.get("p_t3", df.get("p_mean", 0.5)), errors="coerce").fillna(0.5).to_numpy()
+        # ABC segmentation by mu_H quantiles
+        try:
+            q1, q2 = (float(x) for x in str(args.abc_quantiles).split(","))
+        except Exception:
+            q1, q2 = 0.6, 0.9
+        muH = pd.to_numeric(df.get("mu_H", 0.0), errors="coerce").fillna(0.0)
+        t1, t2 = np.quantile(muH.to_numpy(), [q1, q2]) if len(muH) > 0 else (0.0, 0.0)
+        classes = np.where(muH >= t2, "A", np.where(muH >= t1, "B", "C"))
+        beta_vec = np.where(classes == "A", float(args.beta_a), np.where(classes == "B", float(args.beta_b), float(args.beta_c)))
+        # Graph base-stock by class beta
+        z = np.vectorize(inv_norm_cdf)(np.clip(beta_vec, 1e-6, 1-1e-6))
+        mu_H_arr = pd.to_numeric(df.get("mu_H", 0.0), errors="coerce").fillna(0.0).to_numpy()
+        sigma_H_arr = pd.to_numeric(df.get("sigma_H", 1e-6), errors="coerce").fillna(1e-6).to_numpy()
+        onhand_series = df["onhand"] if "onhand" in df.columns else pd.Series(0.0, index=df.index)
+        onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
+        onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
+        onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
+        S_graph = mu_H_arr + z * sigma_H_arr
+        IP = onhand + onorder
+        q_graph = np.rint(np.clip(S_graph - IP, 0.0, None)).astype(int)
+        # two-sided grid if requested
+        if args.grid:
+            tau_list = [float(x.strip()) for x in (args.tau_grid.split(",") if args.tau_grid else ["0.55","0.60","0.65"])]
+            best_tau_hi, best_tau_lo, best_cost = None, None, float("inf")
+            print("Running two-sided τ_hi grid (gated2):")
+            for tau_hi in tau_list:
+                tau_lo = float(args.tau_lo) if args.tau_lo is not None else max(0.0, tau_hi - float(args.tau_margin))
+                q_tmp = hbq.copy()
+                hi = p >= tau_hi
+                lo = p <= tau_lo
+                isA = (classes == "A")
+                q_tmp[hi] = np.maximum(hbq[hi], q_graph[hi])
+                lo_mask = lo & (~isA)
+                q_tmp[lo_mask] = np.minimum(hbq[lo_mask], q_graph[lo_mask])
+                cost = _expected_cost_over_df(df, q_tmp, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
+                print(f"  τ_hi={tau_hi:.2f} (τ_lo={tau_lo:.2f}) -> cost={cost:.2f}")
+                if cost < best_cost:
+                    best_cost, best_tau_hi, best_tau_lo, q_final = cost, tau_hi, tau_lo, q_tmp
+            print(f"Best(two-sided): τ_hi={best_tau_hi:.2f}, τ_lo={best_tau_lo:.2f}, cost={best_cost:.3f}")
+        else:
+            # thresholds single-shot
+            tau_hi = float(args.tau_hi) if args.tau_hi is not None else 0.60
+            tau_lo = float(args.tau_lo) if args.tau_lo is not None else max(0.0, tau_hi - float(args.tau_margin))
+            q_final = hbq.copy()
+            hi = p >= tau_hi
+            lo = p <= tau_lo
+            isA = (classes == "A")
+            q_final[hi] = np.maximum(hbq[hi], q_graph[hi])
+            lo_mask = lo & (~isA)
+            q_final[lo_mask] = np.minimum(hbq[lo_mask], q_graph[lo_mask])
+            best_tau_hi, best_tau_lo = tau_hi, tau_lo
+            best_cost = _expected_cost_over_df(df, q_final, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
+            print(f"Two-sided gated (τ_hi={tau_hi:.2f}, τ_lo={tau_lo:.2f}) -> expected cost={best_cost:.2f}")
+        # write submission
+        out_path = args.submit_blended or (args.submit if args.submit else "orders_blended_two_sided.csv")
+        _ensure_parent_dir(out_path)
+        out = df[["store_id","product_id"]].copy()
+        out["order_qty"] = q_final
+        out.to_csv(out_path, index=False)
+        print(f"Wrote blended submission {out_path} with {len(out)} rows (strategy=gated2).")
+        # sanity
+        try:
+            top_idx = np.argsort(-p)[:50]
+            bot_idx = np.argsort(p)[:50]
+            top_keep = float((q_final[top_idx] >= hbq[top_idx]).mean()) if len(top_idx) else 0.0
+            bot_shrink = float((q_final[bot_idx] <= hbq[bot_idx]).mean()) if len(bot_idx) else 0.0
+            print(f"Sanity: top-50 keep-rate={top_keep:.2f}, bottom-50 shrink-rate={bot_shrink:.2f}")
+        except Exception as e:
+            print(f"[warn] two-sided sanity failed: {e}")
+
     if args.submission_index and (args.submit or args.submit_blended or args.blend in ("hb","graph","gated","shrink")):
         if args.submit:
             print(f"Producing submission from index {args.submission_index} -> {args.submit}")
@@ -535,6 +691,13 @@ def main():
                 else:
                     mu_H = float(feat["mu_H"])  # horizon mean
                     sigma_H = float(feat["sigma_H"])  # horizon std
+                # Retrieve positive component estimates and p_t3
+                if feat:
+                    mu_pos = float(feat.get("mu_hat_plus", 1.0))
+                    sigma_pos = float(feat.get("sigma_hat_plus", 1.0))
+                    p_t3 = float(feat.get("p_t3", feat.get("p_mean", 0.5)))
+                else:
+                    mu_pos, sigma_pos, p_t3 = 1.0, 1.0, 0.5
                 # Critical fractile to z (approx without scipy)
                 # For beta=0.833, z ≈ 0.967. For general beta, use probit approximation.
                 beta = max(1e-6, min(1 - 1e-6, float(args.beta)))
@@ -587,11 +750,20 @@ def main():
                 S = mu_H + z * sigma_H
                 onhand, onorder = state_map.get(key, (0.0, 0.0))
                 IP = onhand + onorder
-                q = max(0.0, S - IP)
-                submissions.append({"store_id": sid, "product_id": pid, "order_qty": int(round(q)), "p_t3": float(feat.get("p_t3", 0.0)) if feat else 0.0})
+                q_graph = max(0.0, S - IP)
+                # Optional mixture policy computation
+                if args.blend in ("mixture","mixture_min"):
+                    c_s = float(args.cost_shortage_mixture if args.cost_shortage_mixture is not None else args.cost_shortage)
+                    c_h = float(args.cost_holding_mixture if args.cost_holding_mixture is not None else args.cost_holding)
+                    S_mix = _mixture_base_stock(p_t3, mu_pos, sigma_pos, c_s, c_h, int(args.horizon))
+                    q_mix = max(0.0, S_mix - IP)
+                    q_final = q_mix if args.blend == "mixture" else (q_mix if _expected_cost_mixture(IP + q_mix, p_t3, mu_pos, sigma_pos, c_s, c_h, int(args.horizon)) < _expected_cost_mixture(IP + q_graph, p_t3, mu_pos, sigma_pos, c_s, c_h, int(args.horizon)) else q_graph)
+                    submissions.append({"store_id": sid, "product_id": pid, "order_qty": int(round(q_final)), "p_t3": p_t3})
+                else:
+                    submissions.append({"store_id": sid, "product_id": pid, "order_qty": int(round(q_graph)), "p_t3": p_t3})
 
         # Optional blending
-        if args.blend in ("hb","graph","gated"):
+        if args.blend in ("hb","graph","gated","shrink","cap","mixture","mixture_min"):
             # Load HB if needed
             hb_map: Dict[Tuple[str, str], int] = {}
             if args.blend in ("hb","gated"):
@@ -645,11 +817,18 @@ def main():
                     alpha = float(args.alpha)
                     q_hb = hb_map.get(key, q_graph)
                     q_final = int(round(max(0.0, q_hb if p >= tau else alpha * q_hb)))
-                else:  # cap: low-p -> min(HB, Graph); high-p -> HB
+                elif args.blend == "cap":  # cap: low-p -> min(HB, Graph); high-p -> HB
                     p = float(s.get("p_t3", 0.0))
                     tau = float(args.tau)
                     q_hb = hb_map.get(key, q_graph)
                     q_final = int(round(max(0.0, q_hb if p >= tau else min(q_hb, q_graph))))
+                elif args.blend == "mixture":
+                    # Already computed in submissions if selected; here ensure HB fallback only if desired
+                    q_final = s["order_qty"]
+                elif args.blend == "mixture_min":
+                    # Choose-min between HB and already computed mixture/graph order
+                    q_hb = hb_map.get(key, s["order_qty"])  # if HB missing, use current
+                    q_final = int(round(min(q_hb, s["order_qty"])) if float(s.get("p_t3", 0.0)) < float(args.tau) else q_hb)
                 blended.append({"store_id": s["store_id"], "product_id": s["product_id"], "order_qty": int(q_final)})
 
             out_path = args.submit_blended or (args.submit if args.submit else "orders_blended.csv")
