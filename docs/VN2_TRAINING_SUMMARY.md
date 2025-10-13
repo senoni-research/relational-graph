@@ -69,7 +69,7 @@ python -u scripts/calibrate_scorer.py \
   --out artifacts/checkpoints/calibrators/iso_val_2024-03-15_idemb.pkl
 ```
 
-### 5) Orders (blended, τ/α grid)
+### 5) Orders (two-sided gated recommended; mixture available)
 ```bash
 python -u scripts/orders_vn2.py \
   --graph artifacts/vn2_graph_full_temporal_v2.jsonl \
@@ -79,13 +79,20 @@ python -u scripts/orders_vn2.py \
   --hops 1 --K 30 \
   --submission-index artifacts/sales_index.csv \
   --state "../vn2inventory/data/Week 0 - 2024-04-08 - Initial State.csv" \
-  --out artifacts/orders_features_idemb.csv \
-  --features-599 artifacts/orders_features_599_idemb.csv \
-  --blend shrink --hb ../vn2inventory/submissions/orders_hierarchical_final_store_cv.csv \
-  --grid --tau-grid 0.50,0.55,0.60 --alpha-grid 0.30,0.50,0.70 \
+  --out artifacts/orders_features_idemb_gated2.csv \
+  --features-599 artifacts/orders_features_599_idemb_gated2.csv \
+  --hb ../vn2inventory/submissions/orders_hierarchical_final_store_cv.csv \
+  --blend gated2 --grid --tau-grid 0.55,0.60,0.65 --tau-margin 0.10 \
+  --abc-quantiles 0.6,0.9 --beta-a 0.88 --beta-b 0.80 --beta-c 0.70 \
   --simulate-cost --cost-shortage 1.0 --cost-holding 0.2 \
-  --submit-blended artifacts/orders_blended_best_idemb.csv
+  --submit-blended artifacts/orders_blended_two_sided.csv
 ```
+
+Notes:
+- Two-sided gated (gated2) lifts HB when p is high (avoid under-ordering) and caps only low-p B/C items; A-class is never capped.
+- Alternative: mixture policies
+  - `--blend mixture` (pure mixture base-stock using calibrated p)
+  - `--blend mixture_min` (conservative cap: min(HB, Mixture) for p below τ)
 
 ## 4) Production checkpoint (ID-embed, Oct 2025)
 
@@ -110,10 +117,11 @@ python -u scripts/orders_vn2.py \
   - Cold: AUC 0.5950, AP 0.6452 (1082 samples)
   - Inv-present: AUC 0.6603, AP 0.7573 (all 2388)
 
-**Orders recommendation**:
-- Submit: `artifacts/orders_blended_best_idemb.csv`
-- Gate: τ=0.50, α=0.70 (shrink; expected cost 4649.85)
-- Sanity: top-50 keep-rate=1.00; bottom-50 shrink-rate=1.00
+**Orders recommendation (current run)**:
+- Submit: `artifacts/orders_blended_two_sided.csv`
+- Two-sided: τ_hi=0.55, τ_lo=0.45 (ABC betas: A=0.88, B=0.80, C=0.70)
+- Expected cost: ≈ 3509.40 vs HB ≈ 4603.93 (∆ ≈ −1094)
+- Sanity: top-50 keep-rate ≈ 1.00; bottom-50 shrink-rate ≈ 0.00 (lift-only in this run)
 
 ## 5) Key features
 
@@ -152,7 +160,19 @@ python -u scripts/orders_vn2.py \
 - 599 rows in platform's Store×Product order
 - Single `order_qty` column (non-negative integers)
 - Start week 2024-04-08 aligns with Initial State
-- Blended sanity: top-50 keep-rate ≈ 1.00; bottom-50 shrink-rate ≈ 1.00
+- Blended sanity: top-50 keep-rate ≈ 1.00; bottom-50 shrink-rate small (≈ 0.0–0.3 depending on policy)
+
+### Convert to platform header
+If needed, convert `store_id,product_id,order_qty` to `Store,Product,0`:
+```bash
+python - << 'PY'
+import pandas as pd
+sub = pd.read_csv('artifacts/orders_blended_two_sided.csv')
+sub = sub.rename(columns={'store_id':'Store','product_id':'Product','order_qty':'0'})
+sub[['Store','Product','0']].to_csv('artifacts/orders_ensembled.csv', index=False)
+print('Wrote artifacts/orders_ensembled.csv')
+PY
+```
 
 ## 8) Next improvements (optional)
 
