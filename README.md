@@ -1,179 +1,118 @@
-## Relational Graph: Subgraph Prediction & LLM QA (MVP)
+## Relational Graph for VN2: Temporal Graph Training and Cost-Aware Ordering
 
 ### Overview
-Graph-structured QA that predicts structure (subgraphs), not just links. We score edges in a fixed-K temporal egonet and decode the most likely connecting subgraph between anchors using k-shortest paths and a Steiner-tree fallback. An LLM-style router calls tools to answer natural-language questions with method, evidence, and caveats.
+This repo builds a temporal MultiGraph from VN2 data, trains a calibrated edge scorer, and produces cost-aware order recommendations. It also includes subgraph decoding and a minimal QA interface, but the current focus is the VN2 competition pipeline.
 
-Key ideas:
-- Fixed-K temporal egonets (≤ anchor_time) to avoid future leakage and keep compute predictable.
-- Pluggable edge scorer interface (RELGT-ready), with a deterministic stub for the MVP.
-- Decoders over costs c(e) = −log p(e): k-shortest paths and Steiner approximations.
-- ReAct-style tool routing for QA; causal questions return clearly labeled non-causal proxies unless a causal engine is configured.
+What's implemented now:
+- VN2 → JSONL v2 generator with ID normalization and inventory-aware zeros
+- Time-aware training with enhanced features (recency, event buckets, relation-aware attention, optional ID embeddings)
+- Proper temporal egonet sampling (strict pre-t), MPS-compatible training, and parallel sampling
+- Checkpointed categorical vocab and calibrators (isotonic/Platt)
+- Order generation with multiple policies: HB baseline, mixture base-stock, and two-sided gated (lift high‑p, cap low‑p)
 
 ### Install
 - Python ≥ 3.10
-- Editable install:
+- Create a venv and install:
 ```bash
-pip install -e .
+python -m venv .venv && source .venv/bin/activate
+pip install -e . -r requirements.txt
 ```
 
-### Quickstart
-Demo data lives in `graph_qa/data/demo_graph.jsonl`. A simple demo notebook is in `notebooks/demo.ipynb`.
-
-- Relationship QA (top-k paths):
-```bash
-relational-graph find-paths --graph graph_qa/data/demo_graph.jsonl --a A --b C --max-len 4 --k 2
-```
-
-- Predict subgraph (structure):
-```bash
-relational-graph predict-subgraph --graph graph_qa/data/demo_graph.jsonl --a A --b C --anchor-time 12 --hops 2 --K 50
-```
-
-- LLM router (stubbed deterministic):
-```bash
-relational-graph ask --graph graph_qa/data/demo_graph.jsonl --question "What is the relationship between A and C?"
-relational-graph ask --graph graph_qa/data/demo_graph.jsonl --question "What is the likelihood that A causes C?"
-```
-
-### Team action step (POC with VN2 data)
-
-**Quick demo (5 min)**
-```bash
-source .venv/bin/activate
-relational-graph ask --graph graph_qa/data/vn2_graph_sample.jsonl --question "What is the relationship between store:0 and product:126?"
-```
-
-**Full workflow (train your own scorer)**
-
-1) Convert VN2 CSVs to graph
+### 1) Generate the temporal graph (v2)
 ```bash
 python scripts/vn2_to_jsonl.py \
   --vn2-data-dir ../vn2inventory/data \
-  --out graph_qa/data/vn2_graph_full_temporal.jsonl \
+  --out artifacts/vn2_graph_full_temporal_v2.jsonl \
   --max-pairs 0 \
-  # Zero-sales policy:
-  # (default) keep zeros only when inventory is present
-  # To drop all zeros: --no-sold-zeros-if-instock
-  # To keep all zeros regardless of inventory: --include-sold-zeros
+  --v2 \
+  --initial-state "../vn2inventory/data/Week 0 - 2024-04-08 - Initial State.csv"
+# Defaults: keep zero-sales only when inventory present; emits MultiGraph temporal edges
 ```
 
-2) Train edge scorer (masked-edge objective)
+### 2) Train the scorer (time-aware, enhanced)
 ```bash
-relational-graph train-scorer \
-  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
-  --train-end 2023-06-30 \
-  --val-end 2023-12-31 \
-  --epochs 10 \
-  --batch-size 32 \
-  --out checkpoints/vn2_scorer.pt
-```
-This learns p(edge | graph context) on temporal train split; validates on held-out weeks.
-
-3) Enhanced/time-aware training (recommended)
-```bash
-relational-graph train-scorer \
-  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
-  --train-end 2023-06-30 \
-  --val-end 2023-12-31 \
-  --epochs 15 \
-  --batch-size 512 \
-  --hidden-dim 32 \
-  --num-layers 2 \
-  --K 30 \
-  --hops 1 \
-  --use-enhanced \
+python -u -m graph_qa.train.trainer \
+  --graph artifacts/vn2_graph_full_temporal_v2.jsonl \
+  --epochs 10 --batch-size 512 --K 30 --hops 1 \
+  --hidden-dim 64 --num-layers 3 --use-enhanced \
+  --lr 0.001 --patience 3 --log-interval 25 --num-workers 4 \
   --time-aware \
-  --out checkpoints/vn2_temporal_scorer.pt
+  --out artifacts/checkpoints/v2_scorer_idemb.pt
 ```
 
-4) Evaluate on test set
+### 3) Calibrate (optional but recommended)
+```bash
+python -u scripts/calibrate_scorer.py \
+  --graph artifacts/vn2_graph_full_temporal_v2.jsonl \
+  --ckpt artifacts/checkpoints/v2_scorer_idemb.pt \
+  --train-end 2024-01-31 --val-end 2024-03-15 \
+  --calibration-method isotonic --input-space prob \
+  --out artifacts/checkpoints/calibrators/iso_val_2024-03-15_idemb.pkl
+```
+
+### 4) Generate orders (recommended: two-sided gated)
+```bash
+python -u scripts/orders_vn2.py \
+  --graph artifacts/vn2_graph_full_temporal_v2.jsonl \
+  --ckpt artifacts/checkpoints/v2_scorer_idemb.pt \
+  --calibrator artifacts/checkpoints/calibrators/iso_val_2024-03-15_idemb.pkl \
+  --train-end 2024-01-31 --start-week 20240408 --horizon 3 \
+  --hops 1 --K 30 \
+  --submission-index artifacts/sales_index.csv \
+  --state "../vn2inventory/data/Week 0 - 2024-04-08 - Initial State.csv" \
+  --out artifacts/orders_features_idemb_gated2.csv \
+  --features-599 artifacts/orders_features_599_idemb_gated2.csv \
+  --hb ../vn2inventory/submissions/orders_hierarchical_final_store_cv.csv \
+  --blend gated2 --grid --tau-grid 0.55,0.60,0.65 --tau-margin 0.10 \
+  --abc-quantiles 0.6,0.9 --beta-a 0.88 --beta-b 0.80 --beta-c 0.70 \
+  --simulate-cost --cost-shortage 1.0 --cost-holding 0.2 \
+  --submit-blended artifacts/orders_blended_two_sided.csv
+```
+This prints expected-cost comparisons and sanity metrics. The resulting 599-row CSV uses `store_id,product_id,order_qty`.
+
+To produce the platform header:
+```bash
+python - << 'PY'
+import pandas as pd
+sub = pd.read_csv('artifacts/orders_blended_two_sided.csv')
+sub = sub.rename(columns={'store_id':'Store','product_id':'Product','order_qty':'0'})
+sub[['Store','Product','0']].to_csv('artifacts/orders_ensembled.csv', index=False)
+print('Wrote artifacts/orders_ensembled.csv')
+PY
+```
+
+Alternative policies available:
+- `--blend mixture` (pure mixture base-stock using calibrated p)
+- `--blend mixture_min` (conservative cap: min(HB, Mixture) when p below τ)
+- `--blend cap` or `--blend shrink` (legacy)
+
+### 5) Evaluate trained models
 ```bash
 python scripts/evaluate_scorer.py \
-  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
-  --ckpt checkpoints/vn2_temporal_scorer.pt \
-  --train-end 2023-06-30 \
-  --val-end 2023-12-31 \
+  --graph artifacts/vn2_graph_full_temporal_v2.jsonl \
+  --ckpt artifacts/checkpoints/v2_scorer_idemb.pt \
   --time-aware
 ```
-Reports AUC/AP on temporally held-out (u,v,t) samples.
+Reports AUC/AP (and calibrated metrics if a calibrator is supplied).
 
-5) Query with learned probabilities
-```bash
-relational-graph predict-subgraph \
-  --graph graph_qa/data/vn2_graph_full_temporal.jsonl \
-  --a store:5 --b product:124 \
-  --scorer-ckpt checkpoints/vn2_temporal_scorer.pt
-```
-Returns edges with learned p(e); paths ranked by cost = −log p(e).
-
-**Next milestone**: Add non-causal "influence" tool for "likelihood/causes" queries using time-respecting paths.
-
-### What’s inside
+### Repo structure (selected)
 ```
 graph_qa/
-  io/loader.py                 # JSONL → NetworkX (node.type, node.time, edge.time)
-  sampling/temporal_egonet.py  # fixed-K egonet sampler (≤ anchor_time)
-  scoring/
-    interfaces.py              # EdgeScorer protocol
-    relgt_stub.py              # logistic baseline p(e) ∈ (0,1)
-    calibrate.py               # temperature/prob calibration helpers
-  decode/
-    costs.py                   # c(e) = -log p(e)
-    ksp.py                     # top-k shortest paths over cost
-    steiner.py                 # Steiner connector (networkx approx)
-    path_score.py              # path scoring (NLL / geometric mean)
-    complete.py                # thresholded completion (MVP)
-  llm/
-    tools.py                   # find_paths, predict_subgraph, relgt_score_edges
-    router.py                  # minimal ReAct-like router
-    prompts.py                 # system & user templates
-  cli.py                       # Typer CLI entry point
-  data/demo_graph.jsonl        # tiny demo graph
+  io/loader.py                 # JSONL → NetworkX (MultiGraph support)
+  sampling/temporal_egonet.py  # strict pre-t temporal egonet sampler
+  train/                       # dataset, trainer, model_v2 (enhanced scorer)
+  scoring/                     # calibration, interfaces
+scripts/
+  vn2_to_jsonl.py              # VN2 → JSONL v2 generator
+  orders_vn2.py                # order generation (policies: HB, mixture, gated2)
+  evaluate_scorer.py           # evaluation and slicing
+  calibrate_scorer.py          # probability calibration (isotonic/Platt)
 ```
 
-### Architecture (MVP)
-```
-  Graph (NetworkX)
-        │
-        ▼
-  Temporal Egonet (≤ T, K nodes)
-        │
-        ▼
-  Edge Scorer (RELGT-ready) ──► p(e)
-        │                         │
-        ▼                         ▼
-      Costs c(e) = −log p(e)   Evidence (edge probs)
-        │
-        ├── k-shortest paths (anchors a↔b)
-        └── Steiner tree (multi-anchors)
-        ▼
-  Predicted Subgraph + Paths
-        │
-        ▼
-  LLM Router → tools (find_paths / predict_subgraph / score_edges)
-        │
-        ▼
-  Answer = result + method + evidence + caveats
-```
+### Notes
+- Mac (MPS) supported for training; parallel sampling uses a long‑lived process pool with fallbacks
+- Time-aware positives: sold>0; hard negatives: inventory-present zeros at time t
+- Checkpoints save categorical vocab and feature flags; evaluators rebuild model config accordingly
 
-### Extending (RELGT / Griffin)
-- Implement `graph_qa/scoring/relgt_wrapper.py` or `graph_qa/scoring/griffin_wrapper.py` to conform to `EdgeScorer.score(G_sub, candidate_edges) -> dict[edge, float]`. The decoders and tools work unchanged.
-- Add tokenization (type, hop, Δtime, local GNN-PE) in the scorer to mirror RELGT inputs. Use temperature scaling/isotonic if calibration matters.
-
-### Tests
-```bash
-pytest -q
-```
-
-### Notes & Caveats
-- Causal questions: the router returns association/influence proxies and lists assumptions unless a causal engine is enabled.
-- `torch_geometric` is optional (not required for MVP); we rely on NetworkX for decoding.
-- The CLI script name is `relational-graph` (see `[project.scripts]` in `pyproject.toml`).
-
-### References
-- RELGT: paper [`arxiv.org/abs/2505.10960`](https://arxiv.org/abs/2505.10960) · code [`github.com/snap-stanford/relgt`](https://github.com/snap-stanford/relgt)
-- ContextGNN: [`github.com/kumo-ai/ContextGNN`](https://github.com/kumo-ai/ContextGNN/blob/master/contextgnn/nn/models/contextgnn.py)
-- Griffin: [`github.com/yanxwb/Griffin`](https://github.com/yanxwb/Griffin)
-- Decoders: NetworkX `shortest_simple_paths`, `approximation.steinertree.steiner_tree`
-
-
+### License
+This project is licensed under the MIT License. See `LICENSE` for details.
