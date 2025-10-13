@@ -320,6 +320,12 @@ def main():
     ap.add_argument("--submit", default=None, type=str, help="If provided, write 599-row orders.csv here with order_qty column")
     ap.add_argument("--beta", default=0.833, type=float, help="Critical fractile (default 1/(1+0.2))")
     ap.add_argument("--features-599", default=None, type=str, help="If provided, write 599-row features aligned to index (includes p_t1..p_t3)")
+    # Transfer-aware adjustments
+    ap.add_argument("--use-transfer", action="store_true", help="Adjust mu_H using transfer weights (product/store)")
+    ap.add_argument("--transfer-weights", type=str, default=None, help="Parquet with product_subst/store_neighbor (_table) weights")
+    ap.add_argument("--transfer-alpha", type=float, default=0.5, help="Scaling for transfer-in contribution (0..1)")
+    ap.add_argument("--subst-topk", type=int, default=5)
+    ap.add_argument("--store-topk", type=int, default=3)
     ap.add_argument("--blend", default="none", choices=["none","hb","graph","gated","gated2","shrink","cap","mixture","mixture_min"], help="Blend submission strategy")
     ap.add_argument("--hb", default=None, type=str, help="Path to HB submission CSV (store_id,product_id,order_qty)")
     ap.add_argument("--tau", default=0.6, type=float, help="Gating threshold on p_t3 for blend=gated")
@@ -599,7 +605,46 @@ def main():
         onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
         onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
         onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
-        S_graph = mu_H_arr + z * sigma_H_arr
+        # Optional: transfer-aware μ'_H
+        if args.use_transfer and args.transfer_weights:
+            try:
+                w = pd.read_parquet(args.transfer_weights)
+                # Build quick lookup indices
+                sub = w[w.get("_table") == "product_subst"][ ["product","product_sub","weight"] ].copy()
+                nbr = w[w.get("_table") == "store_neighbor"][ ["store","store_nbr","weight"] ].copy()
+                # Map for top-K per source
+                def topk_map(dfw, src, dst, k):
+                    m = {}
+                    for s, g in dfw.groupby(src):
+                        gp = g.sort_values("weight", ascending=False).head(k)
+                        m[str(s)] = list(zip(gp[dst].astype(str).tolist(), gp["weight"].astype(float).tolist()))
+                    return m
+                sub_map = topk_map(sub, "product", "product_sub", int(args.subst_topk)) if not sub.empty else {}
+                nbr_map = topk_map(nbr, "store", "store_nbr", int(args.store_topk)) if not nbr.empty else {}
+                # Estimate μ_in from substitutes and neighbors (simple proxy using μ_H of destination)
+                mu_in = np.zeros(len(df), dtype=float)
+                sid = df["store_id"].astype(str).tolist()
+                pid = df["product_id"].astype(str).tolist()
+                for i in range(len(df)):
+                    s = sid[i]; p = pid[i]
+                    # from product substitutes at same store
+                    for (p2, wgt) in sub_map.get(p, [])[: int(args.subst_topk)]:
+                        mask = (df["store_id"] == s) & (df["product_id"] == p2)
+                        if mask.any():
+                            mu_in[i] += float(wgt) * float(df.loc[mask, "mu_H"].values[0])
+                    # from store neighbors same product
+                    for (s2, wgt) in nbr_map.get(s, [])[: int(args.store_topk)]:
+                        mask = (df["store_id"] == s2) & (df["product_id"] == p)
+                        if mask.any():
+                            mu_in[i] += float(wgt) * float(df.loc[mask, "mu_H"].values[0])
+                mu_in = np.asarray(mu_in) * float(args.transfer_alpha)
+                mu_H_eff = mu_H_arr + mu_in
+            except Exception as e:
+                print(f"[warn] transfer adjustment failed: {e}")
+                mu_H_eff = mu_H_arr
+        else:
+            mu_H_eff = mu_H_arr
+        S_graph = mu_H_eff + z * sigma_H_arr
         IP = onhand + onorder
         q_graph = np.rint(np.clip(S_graph - IP, 0.0, None)).astype(int)
         # two-sided grid if requested

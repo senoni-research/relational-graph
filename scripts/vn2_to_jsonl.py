@@ -397,6 +397,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--history-windows", type=str, default="1,2,4,8", help="Comma-separated weeks for rolling sums")
     ap.add_argument("--initial-state", type=str, default=None, help="Path to 'Week 0 - 2024-04-08 - Initial State.csv' to emit a state edge at anchor week")
     ap.add_argument("--emit-no-inventory", action="store_true", help="Emit explicit no_inventory edges when source is an explicit false/0")
+    # Transfer edges
+    ap.add_argument("--transfer-weights", type=str, default=None, help="Parquet file with product_subst and store_neighbor tables (_table tag)")
+    ap.add_argument("--emit-transfer-edges", action="store_true", help="Emit product_substitute and store_neighbor edges from weights")
     return ap.parse_args()
 
 
@@ -427,6 +430,38 @@ def main() -> None:
             add_history_features=args.add_history_features,
             history_windows=windows,
         )
+        # Optional: emit transfer edges (aggregated)
+        if args.emit_transfer_edges and args.transfer_weights:
+            try:
+                w = pd.read_parquet(args.transfer_weights)
+                # Product substitutes: aggregate across stores to global weight
+                df_sub = w[w.get("_table") == "product_subst"][["product","product_sub","weight"]].copy()
+                if not df_sub.empty:
+                    agg = df_sub.groupby(["product","product_sub"], as_index=False)["weight"].mean()
+                    for _, r in agg.iterrows():
+                        p = f"product:{str(r['product']).strip()}"
+                        q = f"product:{str(r['product_sub']).strip()}"
+                        records.append({
+                            "type": "edge",
+                            "u": p,
+                            "v": q,
+                            "attrs": {"rel": "product_substitute", "time": 0, "weight": float(r.get("weight", 0.0))}
+                        })
+                # Store neighbors: aggregate across products to global weight
+                df_st = w[w.get("_table") == "store_neighbor"][ ["store","store_nbr","weight"] ].copy()
+                if not df_st.empty:
+                    agg2 = df_st.groupby(["store","store_nbr"], as_index=False)["weight"].mean()
+                    for _, r in agg2.iterrows():
+                        s = f"store:{str(r['store']).strip()}"
+                        t = f"store:{str(r['store_nbr']).strip()}"
+                        records.append({
+                            "type": "edge",
+                            "u": s,
+                            "v": t,
+                            "attrs": {"rel": "store_neighbor", "time": 0, "weight": float(r.get("weight", 0.0))}
+                        })
+            except Exception as e:
+                print(f"[warn] failed to emit transfer edges: {e}")
         # Optional: add a single state edge per pair from Initial State at anchor week
         if args.initial_state:
             try:
