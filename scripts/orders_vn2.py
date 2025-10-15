@@ -626,15 +626,15 @@ def main():
                 sid = df["store_id"].astype(str).tolist()
                 pid = df["product_id"].astype(str).tolist()
                 for i in range(len(df)):
-                    s = sid[i]; p = pid[i]
+                    sid_i = sid[i]; pid_i = pid[i]
                     # from product substitutes at same store
-                    for (p2, wgt) in sub_map.get(p, [])[: int(args.subst_topk)]:
-                        mask = (df["store_id"] == s) & (df["product_id"] == p2)
+                    for (p2, wgt) in sub_map.get(pid_i, [])[: int(args.subst_topk)]:
+                        mask = (df["store_id"] == sid_i) & (df["product_id"] == p2)
                         if mask.any():
                             mu_in[i] += float(wgt) * float(df.loc[mask, "mu_H"].values[0])
                     # from store neighbors same product
-                    for (s2, wgt) in nbr_map.get(s, [])[: int(args.store_topk)]:
-                        mask = (df["store_id"] == s2) & (df["product_id"] == p)
+                    for (s2, wgt) in nbr_map.get(sid_i, [])[: int(args.store_topk)]:
+                        mask = (df["store_id"] == s2) & (df["product_id"] == pid_i)
                         if mask.any():
                             mu_in[i] += float(wgt) * float(df.loc[mask, "mu_H"].values[0])
                 mu_in = np.asarray(mu_in) * float(args.transfer_alpha)

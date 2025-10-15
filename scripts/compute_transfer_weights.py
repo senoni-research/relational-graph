@@ -23,6 +23,9 @@ import numpy as np
 from graph_qa.io.loader import load_graph
 
 
+# pandas future behavior: avoid silent downcasting warnings
+pd.set_option('future.no_silent_downcasting', True)
+
 def _oos_weeks(G) -> set[Tuple[str, str, int]]:
     # Collect (store, product, week) where has_inventory==False if present; fallback: zero sales following positive history
     oos = set()
@@ -44,8 +47,8 @@ def _taxonomy_key(attrs: dict) -> tuple:
     )
 
 
-def compute_product_substitution(G, topk: int = 5) -> pd.DataFrame:
-    # Aggregate weekly sales by (store, product, week)
+def compute_product_substitution(G, topk: int = 5, min_weeks: int = 3) -> pd.DataFrame:
+    # Collect weekly 'sold' with stockout_last_w1 flag (if present)
     rows = []
     for u, v, key, a in G.edges(data=True, keys=True):
         if a.get("rel") != "sold":
@@ -54,8 +57,9 @@ def compute_product_substitution(G, topk: int = 5) -> pd.DataFrame:
         units = float(a.get("units", 0.0))
         s = u if str(G.nodes[u].get("type")) == "store" else v
         p = v if s == u else u
-        rows.append((str(s), str(p), t, units))
-    df = pd.DataFrame(rows, columns=["store", "product", "week", "units"]) if rows else pd.DataFrame(columns=["store","product","week","units"]) 
+        so = bool(a.get("stockout_last_w1", False))
+        rows.append((str(s), str(p), t, units, so))
+    df = pd.DataFrame(rows, columns=["store", "product", "week", "units", "so_last_w1"]) if rows else pd.DataFrame(columns=["store","product","week","units","so_last_w1"]) 
     if df.empty:
         return pd.DataFrame(columns=["store","product","product_sub","weight"]) 
 
@@ -65,33 +69,48 @@ def compute_product_substitution(G, topk: int = 5) -> pd.DataFrame:
         if str(a.get("type")) == "product":
             prod_tax[str(n)] = _taxonomy_key(a)
 
-    # Build candidate pairs within same store and taxonomy bucket
     subs_records = []
     for store, g in df.groupby("store"):
-        prods = list(g["product"].unique())
-        # baseline mean per product
-        base = g.groupby("product")["units"].mean()
-        # weekly pivot
-        pivot = g.pivot_table(index="week", columns="product", values="units", aggfunc="sum").fillna(0.0)
-        weeks = list(pivot.index)
-        # OOS proxy set (if available)
-        # For now, skip explicit OOS filter; use co-lift normalized by baseline
+        # pivot units and join flags per product
+        units_pivot = g.pivot_table(index="week", columns="product", values="units", aggfunc="sum").fillna(0.0)
+        _flag_tmp = g.pivot_table(index="week", columns="product", values="so_last_w1", aggfunc="max")
+        # Avoid FutureWarning: infer object dtypes before fillna
+        flag_pivot = _flag_tmp.infer_objects(copy=False).fillna(False)
+        prods = list(units_pivot.columns)
         for p in prods:
             # candidate substitutes by taxonomy
             cand = [q for q in prods if q != p and prod_tax.get(q) == prod_tax.get(p)]
+            if not cand:
+                continue
+            # OOS-conditioned uplift: weeks where p had so_last_w1 True vs False
+            so_idx = flag_pivot[p] == True
+            ok_idx = flag_pivot[p] == False
+            if so_idx.sum() < min_weeks or ok_idx.sum() < min_weeks:
+                # insufficient signal; fallback to correlation ranking within taxonomy
+                x = units_pivot[p].values
+                lifts = []
+                for q in cand:
+                    y = units_pivot[q].values
+                    if x.std() < 1e-6 or y.std() < 1e-6:
+                        corr = 0.0
+                    else:
+                        corr = float(np.corrcoef(x, y)[0, 1])
+                    if corr > 0:
+                        lifts.append((q, corr))
+                if not lifts:
+                    continue
+                lifts.sort(key=lambda t: t[1], reverse=True)
+                total = sum(w for _, w in lifts[:topk]) or 1.0
+                for q, w in lifts[:topk]:
+                    subs_records.append((store, p, q, float(w / total)))
+                continue
+            # compute uplift for candidates
             lifts = []
             for q in cand:
-                # co-lift: correlation-weighted uplift relative to baseline
-                x = pivot.get(p, pd.Series(0.0, index=weeks)).values
-                y = pivot.get(q, pd.Series(0.0, index=weeks)).values
-                if x.std() < 1e-6 or y.std() < 1e-6:
-                    corr = 0.0
-                else:
-                    corr = float(np.corrcoef(x, y)[0, 1])
-                uplift = max(0.0, y.mean() - base.get(q, 0.0))
-                score = max(0.0, corr) * uplift
-                if score > 0:
-                    lifts.append((q, score))
+                y = units_pivot[q]
+                uplift = float(y[so_idx].mean() - y[ok_idx].mean())
+                if uplift > 0:
+                    lifts.append((q, uplift))
             if not lifts:
                 continue
             lifts.sort(key=lambda t: t[1], reverse=True)
