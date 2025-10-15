@@ -391,6 +391,7 @@ def main():
                     "recency_norm": getattr(model, "recency_norm", 52.0),
                     "event_buckets": [int(x.strip()) for x in (args.event_buckets.split(",") if args.event_buckets else []) if x.strip()] if hasattr(args, "event_buckets") else None,
                     "rel_aware_attn": bool(getattr(args, "rel_aware_attn", False)),
+                    "id_emb_dim": int(getattr(model, "id_emb_dim", 0)),
                     "negatives_policy": getattr(args, "negatives", None),
                 },
                 out_path,

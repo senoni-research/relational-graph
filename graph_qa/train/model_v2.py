@@ -90,9 +90,14 @@ class EnhancedEdgeScorer(nn.Module):
         for _ in range(num_layers):
             self.attn_layers.append(nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True))
 
-        # Optional relation embeddings for attention modulation
+        # Optional relation embeddings / gating for attention modulation
+        # Map known relation names to indices; default to 'other'
+        self.rel_to_idx: Dict[str, int] = {"sold": 0, "has_inventory": 1, "state": 2, "other": 3}
         if self.rel_aware_attn:
-            self.rel_embed = nn.Embedding(8, hidden_dim)  # small set: sold, has_inventory, ship, other
+            # Lightweight gating path: project relation presence to a scalar gate per neighbor
+            rel_gate_dim = max(16, hidden_dim // 8)
+            self.rel_gate_embed = nn.Embedding(len(self.rel_to_idx), rel_gate_dim)
+            self.rel_gate_proj = nn.Linear(rel_gate_dim, 1)
         
         # Edge predictor with temporal/distance features (+ optional recency + buckets)
         bucket_dim = len(self.event_buckets) * 4 if self.event_buckets else 0  # sales, stockout, inbound, onhand summaries
@@ -183,18 +188,54 @@ class EnhancedEdgeScorer(nn.Module):
                 context_indices[i, :L] = torch.tensor(indices, dtype=torch.long, device=device)
                 key_padding_mask[i, :L] = False  # not padded
 
+            # Pre-compute relation-aware neighbor gates once (constant across layers)
+            rel_gates = None
+            if self.rel_aware_attn:
+                rel_gates = torch.ones((len(nodes), max_len), dtype=torch.float32, device=device)
+                # Helper to get a scalar gate for (src, dst)
+                def _gate_for_pair(src_node: Any, dst_node: Any) -> float:
+                    if src_node == dst_node:
+                        return 1.0
+                    try:
+                        if G_sub.has_edge(src_node, dst_node):
+                            # Aggregate unique relation types across multi-edges
+                            rel_set = set()
+                            if isinstance(G_sub, nx.MultiGraph):
+                                data = G_sub.get_edge_data(src_node, dst_node)
+                                for d in data.values():
+                                    r = str(d.get("rel", "other"))
+                                    rel_set.add(r)
+                            else:
+                                r = str(G_sub.edges[src_node, dst_node].get("rel", "other"))
+                                rel_set.add(r)
+                            if not rel_set:
+                                rel_set.add("other")
+                            emb_sum = torch.zeros(self.rel_gate_embed.embedding_dim, device=device)
+                            for r in rel_set:
+                                idx = self.rel_to_idx.get(r, self.rel_to_idx["other"])
+                                emb_sum = emb_sum + self.rel_gate_embed.weight[idx]
+                            g = torch.sigmoid(self.rel_gate_proj(emb_sum)).squeeze()
+                            return float(g.item())
+                        else:
+                            return 1.0
+                    except Exception:
+                        return 1.0
+                # Fill gates
+                for i, indices in enumerate(neighbor_indices_list):
+                    src = nodes[i]
+                    for j, nb_idx in enumerate(indices):
+                        dst = nodes[nb_idx]
+                        rel_gates[i, j] = _gate_for_pair(src, dst)
+
             for attn_layer in self.attn_layers:
                 # Gather neighbor contexts: (N, max_len, H)
                 context = x[context_indices]
+                # Relation-aware gating (scale neighbor messages)
+                if self.rel_aware_attn and rel_gates is not None:
+                    context = context * rel_gates.unsqueeze(-1)
                 # Queries: (N, 1, H)
                 query = x.unsqueeze(1)
-                if self.rel_aware_attn:
-                    # Simple modulation: add a learned relation bias to keys/values (approximation)
-                    # Here we skip explicit per-edge relation typing for speed and use a shared bias
-                    rel_bias = self.rel_embed.weight.mean(dim=0, keepdim=True).unsqueeze(0).expand_as(context)
-                    attn_out, _ = attn_layer(query, context + rel_bias, context + rel_bias, key_padding_mask=key_padding_mask)
-                else:
-                    attn_out, _ = attn_layer(query, context, context, key_padding_mask=key_padding_mask)
+                attn_out, _ = attn_layer(query, context, context, key_padding_mask=key_padding_mask)
                 x = torch.relu(attn_out.squeeze(1))  # (N, H)
         
         return x
