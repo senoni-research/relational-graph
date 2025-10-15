@@ -291,6 +291,9 @@ def main():
     parser.add_argument("--rank-weight", type=float, default=0.5)
     parser.add_argument("--event-buckets", type=str, default=None, help="Comma-separated weeks for short history features, e.g. '1,2,4,8'")
     parser.add_argument("--rel-aware-attn", action="store_true", help="Use relation-aware attention projections")
+    parser.add_argument("--use-seq-encoder", action="store_true", help="Encode last-N (u,v) events with a small GRU")
+    parser.add_argument("--seq-len", type=int, default=0, help="Number of last events to encode when --use-seq-encoder")
+    parser.add_argument("--peer-features", action="store_true", help="Use peer_mean/max per window if present on edges")
     parser.add_argument("--num-workers", type=int, default=0, help="Parallel workers for subgraph sampling (0=off)")
     args = parser.parse_args()
 
@@ -337,6 +340,8 @@ def main():
             recency_norm=args.recency_norm,
             rel_aware_attn=args.rel_aware_attn,
             event_buckets=event_buckets,
+            use_seq_encoder=args.use_seq_encoder,
+            seq_len=args.seq_len,
         )
     else:
         print("  → Using simple baseline model")
@@ -392,6 +397,8 @@ def main():
                     "event_buckets": [int(x.strip()) for x in (args.event_buckets.split(",") if args.event_buckets else []) if x.strip()] if hasattr(args, "event_buckets") else None,
                     "rel_aware_attn": bool(getattr(args, "rel_aware_attn", False)),
                     "id_emb_dim": int(getattr(model, "id_emb_dim", 0)),
+                    "use_seq_encoder": bool(getattr(args, "use_seq_encoder", False)),
+                    "seq_len": int(getattr(args, "seq_len", 0)),
                     "negatives_policy": getattr(args, "negatives", None),
                 },
                 out_path,
