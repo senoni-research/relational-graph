@@ -304,6 +304,32 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
+def _merge_state(df: pd.DataFrame, state_path: str | None) -> pd.DataFrame:
+    """Merge inventory state (onhand, onorder_le2) into df if state_path provided."""
+    if not state_path:
+        return df
+    st = pd.read_csv(state_path)
+    cols = {c.lower(): c for c in st.columns}
+    sid = cols.get("store_id") or cols.get("store")
+    pid = cols.get("product_id") or cols.get("product")
+    onh = cols.get("onhand") or cols.get("end inventory")
+    it1 = cols.get("in transit w+1")
+    it2 = cols.get("in transit w+2")
+    st = st.rename(columns={sid: "store_id", pid: "product_id"})
+    st["store_id"] = st["store_id"].astype(str)
+    st["product_id"] = st["product_id"].astype(str)
+    st["onhand"] = pd.to_numeric(st.get(onh, 0), errors="coerce").fillna(0.0)
+    st["onorder_le2"] = (
+        pd.to_numeric(st.get(it1, 0), errors="coerce").fillna(0.0) +
+        pd.to_numeric(st.get(it2, 0), errors="coerce").fillna(0.0)
+    )
+    out = df.merge(st[["store_id","product_id","onhand","onorder_le2"]],
+                   on=["store_id","product_id"], how="left")
+    out["onhand"] = out["onhand"].fillna(0.0)
+    out["onorder_le2"] = out["onorder_le2"].fillna(0.0)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate VN2 order features from scorer + calibration")
     ap.add_argument("--graph", required=True, type=str)
@@ -481,6 +507,10 @@ def main():
         hb_qty_col = next((c for c in hb.columns if c.lower() in {"order_qty","orders","qty","0"}), hb.columns[-1])
         df = feat.merge(hb[["store_id","product_id", hb_qty_col]], on=["store_id","product_id"], how="left")
         hbq = pd.to_numeric(df[hb_qty_col], errors="coerce").fillna(0.0).to_numpy()
+        
+        # Merge state (onhand, onorder_le2) if provided
+        df = _merge_state(df, args.state)
+        
         pcol = "p_t3" if "p_t3" in df.columns else df.columns[2]
         p = pd.to_numeric(df[pcol], errors="coerce").fillna(0.5).to_numpy()
         
@@ -582,26 +612,7 @@ def main():
         hbq = pd.to_numeric(df[hb_qty_col], errors="coerce").fillna(0).to_numpy().astype(int) if hb_qty_col else np.zeros(len(df), dtype=int)
         
         # Merge state (onhand, onorder_le2) if provided
-        if args.state:
-            st = pd.read_csv(args.state)
-            cols = {c.lower(): c for c in st.columns}
-            sid = cols.get("store_id") or cols.get("store")
-            pid = cols.get("product_id") or cols.get("product")
-            onh = cols.get("onhand") or cols.get("end inventory")
-            it1 = cols.get("in transit w+1")
-            it2 = cols.get("in transit w+2")
-            st = st.rename(columns={sid: "store_id", pid: "product_id"})
-            st["store_id"] = st["store_id"].astype(str)
-            st["product_id"] = st["product_id"].astype(str)
-            st["onhand"] = pd.to_numeric(st.get(onh, 0), errors="coerce").fillna(0.0)
-            st["onorder_le2"] = (
-                pd.to_numeric(st.get(it1, 0), errors="coerce").fillna(0.0) +
-                pd.to_numeric(st.get(it2, 0), errors="coerce").fillna(0.0)
-            )
-            df = df.merge(st[["store_id","product_id","onhand","onorder_le2"]],
-                          on=["store_id","product_id"], how="left")
-            df["onhand"] = df["onhand"].fillna(0.0)
-            df["onorder_le2"] = df["onorder_le2"].fillna(0.0)
+        df = _merge_state(df, args.state)
         
         # probabilities
         p = pd.to_numeric(df.get("p_t3", df.get("p_mean", 0.5)), errors="coerce").fillna(0.5).to_numpy()
