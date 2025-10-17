@@ -39,6 +39,7 @@ def main():
     p.add_argument("--calibration-method", type=str, default="isotonic", choices=["isotonic", "platt"], help="Calibration method")
     p.add_argument("--input-space", type=str, default="prob", choices=["prob", "logit"], help="Calibrator input space")
     p.add_argument("--out", required=True, type=str)
+    p.add_argument("--segment-by", type=str, default=None, help="Comma-separated node attrs to segment calibrators (e.g., 'Region,Format')")
     args = p.parse_args()
 
     print(f"Loading graph from {args.graph}...")
@@ -79,9 +80,7 @@ def main():
     model.eval()
 
     print("Scoring validation set...")
-    probs = []
-    logits = []
-    labels = []
+    rows = []
     with torch.no_grad():
         for i, (edge, label) in enumerate(val_data):
             if i % 200 == 0:
@@ -89,36 +88,71 @@ def main():
             sub = sample_subgraph_for_edge(G, edge, hops=args.hops, K=args.K)
             if isinstance(edge, (tuple, list)) and len(edge) == 3:
                 ev = (edge[0], edge[1], edge[2])
+                s, p = ev[0], ev[1]
             else:
                 ev = edge
+                s, p = ev[0], ev[1]
             logit = model(sub, [ev]).squeeze(0)
-            prob = torch.sigmoid(logit).item()
-            logits.append(float(logit.item()))
-            probs.append(prob)
-            labels.append(label)
+            prob = float(torch.sigmoid(logit).item())
+            rows.append({
+                "store": str(s),
+                "product": str(p),
+                "prob": prob,
+                "logit": float(logit.item()),
+                "label": int(label),
+                # optional attributes for segmentation
+                "Region": str(G.nodes.get(s, {}).get("Region", "")) if hasattr(G, 'nodes') and G.has_node(s) else "",
+                "Format": str(G.nodes.get(s, {}).get("Format", "")) if hasattr(G, 'nodes') and G.has_node(s) else "",
+            })
 
     print("\nFitting calibrator on validation...")
-    model_obj = None
     meta = {"method": args.calibration_method, "input": args.input_space}
-    if args.calibration_method == "isotonic":
-        iso = IsotonicRegression(out_of_bounds="clip")
-        xs = logits if args.input_space == "logit" else probs
-        _ = iso.fit_transform(xs, labels)
-        model_obj = iso
+    segments = [s.strip() for s in args.segment_by.split(",")] if args.segment_by else None
+    
+    def _fit(xs, ys):
+        if args.calibration_method == "isotonic":
+            iso = IsotonicRegression(out_of_bounds="clip")
+            _ = iso.fit_transform(xs, ys)
+            return iso
+        else:
+            import numpy as np
+            X = np.array(xs, dtype=float).reshape(-1, 1)
+            y = np.array(ys, dtype=int)
+            lr = LogisticRegression(solver="lbfgs")
+            lr.fit(X, y)
+            return lr
+    
+    out_dir = os.path.dirname(args.out)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    
+    if not segments:
+        # Single global calibrator
+        xs = [r[args.input_space] for r in rows]
+        ys = [r["label"] for r in rows]
+        model_obj = _fit(xs, ys)
+        with open(args.out, "wb") as f:
+            pickle.dump({"method": meta["method"], "input": meta["input"], "model": model_obj}, f)
+        print(f"Saved calibrator to {args.out} ({meta['method']}, input={meta['input']})")
     else:
-        # Platt scaling via logistic regression on chosen input space
-        xs = logits if args.input_space == "logit" else probs
-        import numpy as np
-        X = np.array(xs, dtype=float).reshape(-1, 1)
-        y = np.array(labels, dtype=int)
-        lr = LogisticRegression(solver="lbfgs")
-        lr.fit(X, y)
-        model_obj = lr
-
-    Path(os.path.dirname(args.out)).mkdir(parents=True, exist_ok=True)
-    with open(args.out, "wb") as f:
-        pickle.dump({"method": meta["method"], "input": meta["input"], "model": model_obj}, f)
-    print(f"Saved calibrator to {args.out} ({meta['method']}, input={meta['input']})")
+        # Segmented calibrators
+        for r in rows:
+            r["_seg_key"] = tuple(str(r.get(col, "")) for col in segments)
+        from collections import defaultdict
+        bucket = defaultdict(list)
+        for r in rows:
+            bucket[r["_seg_key"]].append(r)
+        for key, items in bucket.items():
+            xs = [it[args.input_space] for it in items]
+            ys = [it["label"] for it in items]
+            if len(set(ys)) < 2:
+                print(f"[warn] segment {key} has single-class labels; skipping")
+                continue
+            model_obj = _fit(xs, ys)
+            seg_name = "__".join(f"{segments[i]}={key[i]}" for i in range(len(segments)))
+            out_path = os.path.join(out_dir, f"{Path(args.out).stem}.{seg_name}{Path(args.out).suffix}")
+            with open(out_path, "wb") as f:
+                pickle.dump({"method": meta["method"], "input": meta["input"], "model": model_obj, "segment": segments, "key": key}, f)
+            print(f"Saved segment calibrator: {out_path}")
 
 
 if __name__ == "__main__":
