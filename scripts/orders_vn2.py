@@ -580,6 +580,29 @@ def main():
         hb_qty_col = next((c for c in hb.columns if c.lower() in {"order_qty","orders","qty","0"}), (hb.columns[-1] if len(hb.columns) else None))
         df = feat.merge(hb[["store_id","product_id", hb_qty_col]] if hb_qty_col else hb, on=["store_id","product_id"], how="left")
         hbq = pd.to_numeric(df[hb_qty_col], errors="coerce").fillna(0).to_numpy().astype(int) if hb_qty_col else np.zeros(len(df), dtype=int)
+        
+        # Merge state (onhand, onorder_le2) if provided
+        if args.state:
+            st = pd.read_csv(args.state)
+            cols = {c.lower(): c for c in st.columns}
+            sid = cols.get("store_id") or cols.get("store")
+            pid = cols.get("product_id") or cols.get("product")
+            onh = cols.get("onhand") or cols.get("end inventory")
+            it1 = cols.get("in transit w+1")
+            it2 = cols.get("in transit w+2")
+            st = st.rename(columns={sid: "store_id", pid: "product_id"})
+            st["store_id"] = st["store_id"].astype(str)
+            st["product_id"] = st["product_id"].astype(str)
+            st["onhand"] = pd.to_numeric(st.get(onh, 0), errors="coerce").fillna(0.0)
+            st["onorder_le2"] = (
+                pd.to_numeric(st.get(it1, 0), errors="coerce").fillna(0.0) +
+                pd.to_numeric(st.get(it2, 0), errors="coerce").fillna(0.0)
+            )
+            df = df.merge(st[["store_id","product_id","onhand","onorder_le2"]],
+                          on=["store_id","product_id"], how="left")
+            df["onhand"] = df["onhand"].fillna(0.0)
+            df["onorder_le2"] = df["onorder_le2"].fillna(0.0)
+        
         # probabilities
         p = pd.to_numeric(df.get("p_t3", df.get("p_mean", 0.5)), errors="coerce").fillna(0.5).to_numpy()
         # ABC segmentation by mu_H quantiles
