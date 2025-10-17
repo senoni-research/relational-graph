@@ -85,34 +85,21 @@ def build_model_from_ckpt(G: nx.Graph, ckpt_path: str) -> torch.nn.Module:
     return model
 
 
-def score_edge(model: torch.nn.Module, G: nx.Graph, edge: Tuple[Any, Any, int], hops: int, K: int, calibrator: dict | None, calibrators_by_key: dict | None = None, seg_cols: list[str] | None = None) -> float:
+def score_edge(model: torch.nn.Module, G: nx.Graph, edge: Tuple[Any, Any, int], hops: int, K: int, calibrator: dict | None) -> float:
     sub = sample_subgraph_for_edge(G, edge, hops=hops, K=K)
     ev = (edge[0], edge[1], edge[2])
     with torch.no_grad():
         logit = model(sub, [ev]).squeeze(0)
         raw_logit = float(logit.item())
         prob = 1.0 / (1.0 + math.exp(-raw_logit))
-        if calibrator is not None or calibrators_by_key is not None:
-            # Default calibrator
-            method = calibrator.get("method", "isotonic") if calibrator else "isotonic"
-            input_space = calibrator.get("input", "prob") if calibrator else "prob"
-            model_obj = calibrator["model"] if calibrator else None
-            # Segment-aware override
-            if calibrators_by_key is not None and seg_cols:
-                s, p = edge[0], edge[1]
-                def _get(n, col):
-                    try:
-                        return str(G.nodes[n].get(col, ""))
-                    except Exception:
-                        return ""
-                key = tuple(_get(s, c) for c in seg_cols)
-                seg_cal = calibrators_by_key.get(key)
-                if seg_cal is not None:
-                    method = seg_cal.get("method", method)
-                    input_space = seg_cal.get("input", input_space)
-                    model_obj = seg_cal.get("model", model_obj)
-            # Apply
-            X = [raw_logit] if input_space == "logit" else [prob]
+        if calibrator is not None:
+            method = calibrator.get("method", "isotonic")
+            input_space = calibrator.get("input", "prob")
+            model_obj = calibrator["model"]
+            if input_space == "logit":
+                X = [raw_logit]
+            else:
+                X = [prob]
             if hasattr(model_obj, "transform"):
                 prob = float(model_obj.transform(X)[0])
             else:
@@ -322,8 +309,6 @@ def main():
     ap.add_argument("--graph", required=True, type=str)
     ap.add_argument("--ckpt", required=True, type=str)
     ap.add_argument("--calibrator", default=None, type=str)
-    ap.add_argument("--calibrator-dir", default=None, type=str, help="Directory with per-segment calibrators")
-    ap.add_argument("--segment-cols", default=None, type=str, help="Comma-separated node attrs to segment (e.g., 'Region,Format')")
     ap.add_argument("--train-end", default="2024-01-31", type=str)
     ap.add_argument("--start-week", default=None, type=str, help="YYYYMMDD start week (default: next Monday after train_end)")
     ap.add_argument("--horizon", default=3, type=int)
@@ -368,26 +353,13 @@ def main():
     model = build_model_from_ckpt(G, args.ckpt)
 
     calibrator = None
-    calibrators_by_key = None
-    seg_cols = [s.strip() for s in args.segment_cols.split(",")] if args.segment_cols else []
-    if args.calibrator and not args.calibrator_dir:
+    if args.calibrator:
         with open(args.calibrator, "rb") as f:
             cal = pickle.load(f)
-        calibrator = cal if (isinstance(cal, dict) and "model" in cal) else {"method": "isotonic", "input": "prob", "model": cal}
-    elif args.calibrator_dir:
-        calibrators_by_key = {}
-        for fn in os.listdir(args.calibrator_dir):
-            if not fn.endswith((".pkl", ".pickle")):
-                continue
-            path = os.path.join(args.calibrator_dir, fn)
-            try:
-                with open(path, "rb") as f:
-                    cal = pickle.load(f)
-                key = cal.get("key")
-                if key is not None:
-                    calibrators_by_key[tuple(key)] = cal
-            except Exception:
-                continue
+        if isinstance(cal, dict) and "model" in cal:
+            calibrator = cal
+        else:
+            calibrator = {"method": "isotonic", "input": "prob", "model": cal}
 
     # Parse dates
     train_end_int = int(str(args.train_end).replace("-", ""))
@@ -413,7 +385,7 @@ def main():
             p_list = []
             p_weeks = []
             for _ in range(int(args.horizon)):
-                prob = score_edge(model, G, (s, p, week), hops=args.hops, K=args.K, calibrator=calibrator, calibrators_by_key=calibrators_by_key, seg_cols=seg_cols)
+                prob = score_edge(model, G, (s, p, week), hops=args.hops, K=args.K, calibrator=calibrator)
                 p_list.append(prob)
                 p_weeks.append(prob)
                 # advance by 7 days

@@ -33,9 +33,6 @@ class EnhancedEdgeScorer(nn.Module):
         store_ids: List[Any] | None = None,
         product_ids: List[Any] | None = None,
         id_emb_dim: int = 16,
-        use_seq_encoder: bool = False,
-        seq_len: int = 0,
-        peer_features: bool = False,
     ):
         super().__init__()
         # Ensure explicit UNK handling and stable categorical normalization
@@ -73,16 +70,6 @@ class EnhancedEdgeScorer(nn.Module):
         self.rel_aware_attn = bool(rel_aware_attn)
         # Event-bucket windows (weeks)
         self.event_buckets = list(event_buckets) if event_buckets else []
-        # Optional peer feature toggle (expects peer_mean_w{w} and peer_max_w{w} if enabled)
-        self.peer_features = bool(peer_features)
-
-        # Optional last-N event sequence encoder (u,v history)
-        self.use_seq_encoder = bool(use_seq_encoder and seq_len and seq_len > 0)
-        self.seq_len = int(seq_len if self.use_seq_encoder else 0)
-        self.seq_hidden_dim = hidden_dim // 4 if self.use_seq_encoder else 0
-        if self.use_seq_encoder:
-            # Input: [delta_weeks, units, inv_flag, woy_sin]
-            self.seq_gru = nn.GRU(input_size=4, hidden_size=self.seq_hidden_dim, batch_first=True)
 
         # Optional ID embeddings (store/product)
         self.has_id_embeddings = store_ids is not None and product_ids is not None and id_emb_dim > 0
@@ -103,20 +90,13 @@ class EnhancedEdgeScorer(nn.Module):
         for _ in range(num_layers):
             self.attn_layers.append(nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True))
 
-        # Optional relation embeddings / gating for attention modulation
-        # Map known relation names to indices; default to 'other'
-        self.rel_to_idx: Dict[str, int] = {"sold": 0, "has_inventory": 1, "state": 2, "other": 3}
+        # Optional relation embeddings for attention modulation
         if self.rel_aware_attn:
-            # Lightweight gating path: project relation presence to a scalar gate per neighbor
-            rel_gate_dim = max(16, hidden_dim // 8)
-            self.rel_gate_embed = nn.Embedding(len(self.rel_to_idx), rel_gate_dim)
-            self.rel_gate_proj = nn.Linear(rel_gate_dim, 1)
+            self.rel_embed = nn.Embedding(8, hidden_dim)  # small set: sold, has_inventory, ship, other
         
         # Edge predictor with temporal/distance features (+ optional recency + buckets)
         bucket_dim = len(self.event_buckets) * 4 if self.event_buckets else 0  # sales, stockout, inbound, onhand summaries
-        # Optional peer mean/max per window
-        peer_dim = (len(self.event_buckets) * 2) if (self.event_buckets and self.peer_features) else 0
-        edge_feat_dim = 2 + (1 if self.recency_feature else 0) + bucket_dim + peer_dim + (self.seq_hidden_dim)
+        edge_feat_dim = 2 + (1 if self.recency_feature else 0) + bucket_dim
         # Add learned ID biases (store/product) via a small bias head
         self.edge_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2 + edge_feat_dim + (2 * self.id_emb_dim), hidden_dim),
@@ -203,54 +183,18 @@ class EnhancedEdgeScorer(nn.Module):
                 context_indices[i, :L] = torch.tensor(indices, dtype=torch.long, device=device)
                 key_padding_mask[i, :L] = False  # not padded
 
-            # Pre-compute relation-aware neighbor gates once (constant across layers)
-            rel_gates = None
-            if self.rel_aware_attn:
-                rel_gates = torch.ones((len(nodes), max_len), dtype=torch.float32, device=device)
-                # Helper to get a scalar gate for (src, dst)
-                def _gate_for_pair(src_node: Any, dst_node: Any) -> float:
-                    if src_node == dst_node:
-                        return 1.0
-                    try:
-                        if G_sub.has_edge(src_node, dst_node):
-                            # Aggregate unique relation types across multi-edges
-                            rel_set = set()
-                            if isinstance(G_sub, nx.MultiGraph):
-                                data = G_sub.get_edge_data(src_node, dst_node)
-                                for d in data.values():
-                                    r = str(d.get("rel", "other"))
-                                    rel_set.add(r)
-                            else:
-                                r = str(G_sub.edges[src_node, dst_node].get("rel", "other"))
-                                rel_set.add(r)
-                            if not rel_set:
-                                rel_set.add("other")
-                            emb_sum = torch.zeros(self.rel_gate_embed.embedding_dim, device=device)
-                            for r in rel_set:
-                                idx = self.rel_to_idx.get(r, self.rel_to_idx["other"])
-                                emb_sum = emb_sum + self.rel_gate_embed.weight[idx]
-                            g = torch.sigmoid(self.rel_gate_proj(emb_sum)).squeeze()
-                            return float(g.item())
-                        else:
-                            return 1.0
-                    except Exception:
-                        return 1.0
-                # Fill gates
-                for i, indices in enumerate(neighbor_indices_list):
-                    src = nodes[i]
-                    for j, nb_idx in enumerate(indices):
-                        dst = nodes[nb_idx]
-                        rel_gates[i, j] = _gate_for_pair(src, dst)
-
             for attn_layer in self.attn_layers:
                 # Gather neighbor contexts: (N, max_len, H)
                 context = x[context_indices]
-                # Relation-aware gating (scale neighbor messages)
-                if self.rel_aware_attn and rel_gates is not None:
-                    context = context * rel_gates.unsqueeze(-1)
                 # Queries: (N, 1, H)
                 query = x.unsqueeze(1)
-                attn_out, _ = attn_layer(query, context, context, key_padding_mask=key_padding_mask)
+                if self.rel_aware_attn:
+                    # Simple modulation: add a learned relation bias to keys/values (approximation)
+                    # Here we skip explicit per-edge relation typing for speed and use a shared bias
+                    rel_bias = self.rel_embed.weight.mean(dim=0, keepdim=True).unsqueeze(0).expand_as(context)
+                    attn_out, _ = attn_layer(query, context + rel_bias, context + rel_bias, key_padding_mask=key_padding_mask)
+                else:
+                    attn_out, _ = attn_layer(query, context, context, key_padding_mask=key_padding_mask)
                 x = torch.relu(attn_out.squeeze(1))  # (N, H)
         
         return x
@@ -338,8 +282,6 @@ class EnhancedEdgeScorer(nn.Module):
                     recency_scalar = math.log1p(float(weeks)) / denom
                 edge_feat_list.append(recency_scalar)
             # Event-bucket summaries (cheap aggregations over pre-t subgraph)
-            peer_means = []
-            peer_maxes = []
             if self.event_buckets:
                 # Consume precomputed v2 history attrs from the original graph nodes/edges if present
                 # We read from G_sub edge attrs for (u,v) at the last pre-t time if available
@@ -374,11 +316,6 @@ class EnhancedEdgeScorer(nn.Module):
                             val = src.get(f"lag_sum_w{w}")
                             if val is not None:
                                 sales_buckets[idx_w] = float(val)
-                            if self.peer_features:
-                                pm = src.get(f"peer_mean_w{w}")
-                                px = src.get(f"peer_max_w{w}")
-                                peer_means.append(float(pm) if pm is not None else 0.0)
-                                peer_maxes.append(float(px) if px is not None else 0.0)
                         inv_now = src.get("inv_present_now")
                         if inv_now is not None:
                             onhand_buckets = [float(inv_now)] * len(self.event_buckets)
@@ -388,57 +325,9 @@ class EnhancedEdgeScorer(nn.Module):
                 except Exception:
                     pass
                 edge_feat_list.extend(sales_buckets + stockout_buckets + inbound_buckets + onhand_buckets)
-                if self.peer_features:
-                    # Ensure consistent length across windows even if some are missing
-                    # If not populated above (e.g., no src), fill zeros
-                    if len(peer_means) != len(self.event_buckets):
-                        # normalize to length |event_buckets|
-                        peer_means = (peer_means + [0.0] * len(self.event_buckets))[: len(self.event_buckets)]
-                    if len(peer_maxes) != len(self.event_buckets):
-                        peer_maxes = (peer_maxes + [0.0] * len(self.event_buckets))[: len(self.event_buckets)]
-                    edge_feat_list.extend(peer_means + peer_maxes)
 
-            # Optional last-N sequence features via GRU
-            seq_vec = None
-            if self.use_seq_encoder and t_anchor is not None and isinstance(G_sub, nx.MultiGraph) and G_sub.has_edge(u, v):
-                try:
-                    data = G_sub.get_edge_data(u, v)
-                    # collect pre-anchor events sorted by time
-                    events = []
-                    for d in data.values():
-                        tt = d.get("time", None)
-                        if tt is None or int(tt) >= int(t_anchor):
-                            continue
-                        units = float(d.get("units", 0.0) or 0.0)
-                        inv_flag = 1.0 if bool(d.get("present", False)) else (1.0 if units > 0.0 else 0.0)
-                        woy_sin = float(d.get("woy_sin", 0.0) or 0.0)
-                        events.append((int(tt), units, inv_flag, woy_sin))
-                    events.sort(key=lambda x: x[0])
-                    # take last-N
-                    last = events[-self.seq_len :] if self.seq_len > 0 else events
-                    seq = []
-                    prev_t = int(last[0][0]) if last else int(t_anchor)
-                    for (tt, units, inv_flag, woy_sin) in last:
-                        delta_w = 0
-                        try:
-                            delta_w = max(0, int(tt) - int(prev_t))
-                        except Exception:
-                            delta_w = 0
-                        prev_t = tt
-                        seq.append([float(delta_w), float(units), float(inv_flag), float(woy_sin)])
-                    if not seq:
-                        seq = [[0.0, 0.0, 0.0, 0.0]]
-                    seq_t = torch.tensor(seq, dtype=torch.float32, device=device).unsqueeze(0)
-                    _, h_n = self.seq_gru(seq_t)  # h_n: (1, 1, H)
-                    seq_vec = h_n.squeeze(0).squeeze(0)  # (H,)
-                except Exception:
-                    seq_vec = None
-
-            edge_scalars = torch.tensor(edge_feat_list, dtype=torch.float32, device=device)
-            parts = [u_emb, v_emb, edge_scalars]
-            if self.use_seq_encoder and seq_vec is not None:
-                parts.append(seq_vec)
-            concat = torch.cat(parts, dim=0)
+            edge_feats = torch.tensor(edge_feat_list, dtype=torch.float32, device=device)
+            concat = torch.cat([u_emb, v_emb, edge_feats], dim=0)
             # Optional ID embeddings concatenated
             if self.has_id_embeddings:
                 sid_idx = self.store_id_to_idx.get(str(u).replace("store:", ""), 0)
@@ -474,9 +363,6 @@ def build_enhanced_model(
     rel_aware_attn: bool = False,
     event_buckets: List[int] | None = None,
     id_emb_dim: int = 16,
-    use_seq_encoder: bool = False,
-    seq_len: int = 0,
-    peer_features: bool = False,
 ) -> EnhancedEdgeScorer:
     """Build an enhanced scorer from a graph (infer node types and categorical attributes)."""
     node_types_set = set()
@@ -508,9 +394,6 @@ def build_enhanced_model(
         store_ids=store_ids,
         product_ids=product_ids,
         id_emb_dim=id_emb_dim,
-        use_seq_encoder=use_seq_encoder,
-        seq_len=seq_len,
-        peer_features=peer_features,
     )
     model.fast_mode = fast_mode
     model.skip_hopdist = skip_hopdist

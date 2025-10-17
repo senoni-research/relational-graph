@@ -302,40 +302,6 @@ def build_graph_records_v2(
     sales_dates_sorted = sales_dates
     date_ints = [ymd_to_int(d) for d in sales_dates_sorted]
 
-    # Optional: precompute peer aggregates per (Product, Date) across stores
-    peer_keyed: dict[tuple[str, str], dict[str, float]] = {}
-    try:
-        d2i = {d: i for i, d in enumerate(sales_dates_sorted)}
-        # Build matrix of units by (Product, Date) across stores
-        units_by_prod_date: dict[tuple[str, str], list[float]] = {}
-        for _, row in sales.iterrows():
-            prod = str(row["Product"]).strip()
-            for d in sales_dates_sorted:
-                val = row.get(d, 0)
-                try:
-                    units = float(val) if pd.notna(val) else 0.0
-                except Exception:
-                    units = 0.0
-                units_by_prod_date.setdefault((prod, d), []).append(units)
-        # Compute rolling peer mean/max for requested windows
-        windows = list(history_windows)
-        for (prod, d), arr in units_by_prod_date.items():
-            t = d2i.get(d, None)
-            if t is None:
-                continue
-            peer_keyed[(prod, d)] = {}
-            for w in windows:
-                s = max(0, t - int(w))
-                window_vals = arr[s:t]
-                if window_vals:
-                    peer_keyed[(prod, d)][f"peer_mean_w{w}"] = float(pd.Series(window_vals).mean())
-                    peer_keyed[(prod, d)][f"peer_max_w{w}"] = float(pd.Series(window_vals).max())
-                else:
-                    peer_keyed[(prod, d)][f"peer_mean_w{w}"] = 0.0
-                    peer_keyed[(prod, d)][f"peer_max_w{w}"] = 0.0
-    except Exception:
-        peer_keyed = {}
-
     # Iterate and build edges with history
     for _, row in sales.iterrows():
         u = canon_id("store", row["Store"])
@@ -390,19 +356,6 @@ def build_graph_records_v2(
                     attrs["inv_present_now"] = bool(inv_present)
                     if t > 0:
                         attrs["stockout_last_w1"] = bool(not inv_series[t - 1])
-                    # Add peer stats if available for (Product, Date)
-                    try:
-                        key_pd = (str(row["Product"]).strip(), sales_dates_sorted[t])
-                        pvals = peer_keyed.get(key_pd, {})
-                        for w in history_windows:
-                            pm = pvals.get(f"peer_mean_w{w}")
-                            px = pvals.get(f"peer_max_w{w}")
-                            if pm is not None:
-                                attrs[f"peer_mean_w{w}"] = float(pm)
-                            if px is not None:
-                                attrs[f"peer_max_w{w}"] = float(px)
-                    except Exception:
-                        pass
                 # week-of-year seasonality (sin/cos)
                 try:
                     iso_week = _date.fromisoformat(d).isocalendar().week
