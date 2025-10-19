@@ -179,6 +179,21 @@ def _expected_cost_over_df(df: pd.DataFrame, q: np.ndarray, cost_shortage: float
     S = onhand + onorder + np.asarray(q, dtype=float)
     return _expected_cost(mu_H_arr, sigma_H_arr, S, cost_shortage, cost_holding_per_week, horizon)
 
+def _expected_cost_mixture_over_df(df: pd.DataFrame, q: np.ndarray, cost_shortage: float, cost_holding_per_week: float, horizon: int) -> float:
+    """Row-wise mixture expected cost using p_t3/p_mean and mu_hat_plus/sigma_hat_plus."""
+    mu_pos = pd.to_numeric(df.get("mu_hat_plus", 0.0), errors="coerce").fillna(0.0).to_numpy()
+    sigma_pos = pd.to_numeric(df.get("sigma_hat_plus", 1e-6), errors="coerce").fillna(1e-6).to_numpy()
+    p = pd.to_numeric(df.get("p_t3", df.get("p_mean", 0.5)), errors="coerce").fillna(0.5).to_numpy()
+    onhand_series = df["onhand"] if "onhand" in df.columns else pd.Series(0.0, index=df.index)
+    onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
+    onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
+    onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
+    S = onhand + onorder + np.asarray(q, dtype=float)
+    total = 0.0
+    for i in range(len(S)):
+        total += _expected_cost_mixture(float(S[i]), float(p[i]), float(mu_pos[i]), float(sigma_pos[i]), float(cost_shortage), float(cost_holding_per_week), int(horizon))
+    return float(total)
+
 # Fast inverse normal CDF approximation (Abramowitz-Stegun style)
 def inv_norm_cdf(p: float) -> float:
     p = float(max(1e-12, min(1-1e-12, p)))
@@ -383,6 +398,7 @@ def main():
     ap.add_argument("--simulate-cost", action="store_true", help="Use expected-cost proxy (shortage=1, holding per week as given) when running --grid")
     ap.add_argument("--cost-shortage", type=float, default=1.0, help="Shortage cost per unit for grid cost proxy")
     ap.add_argument("--cost-holding", type=float, default=0.2, help="Holding cost per unit per week for grid cost proxy")
+    ap.add_argument("--expected-cost-mode", type=str, default="normal", choices=["normal","mixture"], help="Which expected cost model to use for --simulate-cost and gated2 evaluation")
     ap.add_argument("--sanity-k", type=int, default=50, help="Top/Bottom K for sanity keep/shrink checks")
     args = ap.parse_args()
 
@@ -518,7 +534,7 @@ def main():
             raise SystemExit("--grid requires --hb")
         if not args.features_599:
             raise SystemExit("--grid requires --features-599")
-        print("Running τ/α grid...")
+        print(f"Running τ/α grid... (expected-cost-mode={args.expected_cost_mode})")
         tau_list = [float(x.strip()) for x in (args.tau_grid.split(",") if args.tau_grid else ["0.50","0.55","0.60"])]
         alpha_list = [float(x.strip()) for x in (args.alpha_grid.split(",") if args.alpha_grid else ["0.30","0.50","0.70"])]
         # Load features and HB for grid
@@ -548,18 +564,21 @@ def main():
                 w = np.where(p >= tau, 1.0, alpha)
                 q = np.rint(np.clip(w * hbq, 0.0, None)).astype(int)
                 if args.simulate_cost:
-                    # Compute expected cost using per-row mu_H/sigma_H if present; else derive from features
-                    if "mu_H" in df.columns and "sigma_H" in df.columns:
-                        mu_H_arr = pd.to_numeric(df["mu_H"], errors="coerce").fillna(0.0).to_numpy()
-                        sigma_H_arr = pd.to_numeric(df["sigma_H"], errors="coerce").fillna(1e-6).to_numpy()
+                    # Compute expected cost using chosen mode
+                    if args.expected_cost_mode == "mixture":
+                        cost = _expected_cost_mixture_over_df(df, q, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
                     else:
-                        mu_H_arr, sigma_H_arr = _compute_mu_sigma_H_from_rows(rows, args.horizon)
-                    # Inventory position components (default to zeros if not provided)
-                    onhand_series = df["onhand"] if "onhand" in df.columns else pd.Series(0.0, index=df.index)
-                    onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
-                    onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
-                    onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
-                    cost = _expected_cost(mu_H_arr, sigma_H_arr, onhand + onorder + q, args.cost_shortage, args.cost_holding, args.horizon)
+                        if "mu_H" in df.columns and "sigma_H" in df.columns:
+                            mu_H_arr = pd.to_numeric(df["mu_H"], errors="coerce").fillna(0.0).to_numpy()
+                            sigma_H_arr = pd.to_numeric(df["sigma_H"], errors="coerce").fillna(1e-6).to_numpy()
+                        else:
+                            mu_H_arr, sigma_H_arr = _compute_mu_sigma_H_from_rows(rows, args.horizon)
+                        # Inventory position components (default to zeros if not provided)
+                        onhand_series = df["onhand"] if "onhand" in df.columns else pd.Series(0.0, index=df.index)
+                        onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
+                        onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
+                        onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
+                        cost = _expected_cost(mu_H_arr, sigma_H_arr, onhand + onorder + q, args.cost_shortage, args.cost_holding, args.horizon)
                     score = cost
                     logs.append(f"α={alpha:.2f} cost={cost:.2f}")
                     better = cost < best_score
@@ -665,7 +684,7 @@ def main():
         if args.grid:
             tau_list = [float(x.strip()) for x in (args.tau_grid.split(",") if args.tau_grid else ["0.55","0.60","0.65"])]
             best_tau_hi, best_tau_lo, best_cost = None, None, float("inf")
-            print("Running two-sided τ_hi grid (gated2):")
+            print(f"Running two-sided τ_hi grid (gated2, expected-cost-mode={args.expected_cost_mode}):")
             for tau_hi in tau_list:
                 tau_lo = float(args.tau_lo) if args.tau_lo is not None else max(0.0, tau_hi - float(args.tau_margin))
                 q_tmp = hbq.copy()
@@ -675,7 +694,10 @@ def main():
                 q_tmp[hi] = np.maximum(hbq[hi], q_graph[hi])
                 lo_mask = lo & (~isA)
                 q_tmp[lo_mask] = np.minimum(hbq[lo_mask], q_graph[lo_mask])
-                cost = _expected_cost_over_df(df, q_tmp, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
+                if args.expected_cost_mode == "mixture":
+                    cost = _expected_cost_mixture_over_df(df, q_tmp, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
+                else:
+                    cost = _expected_cost_over_df(df, q_tmp, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
                 print(f"  τ_hi={tau_hi:.2f} (τ_lo={tau_lo:.2f}) -> cost={cost:.2f}")
                 if cost < best_cost:
                     best_cost, best_tau_hi, best_tau_lo, q_final = cost, tau_hi, tau_lo, q_tmp
@@ -692,7 +714,10 @@ def main():
             lo_mask = lo & (~isA)
             q_final[lo_mask] = np.minimum(hbq[lo_mask], q_graph[lo_mask])
             best_tau_hi, best_tau_lo = tau_hi, tau_lo
-            best_cost = _expected_cost_over_df(df, q_final, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
+            if args.expected_cost_mode == "mixture":
+                best_cost = _expected_cost_mixture_over_df(df, q_final, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
+            else:
+                best_cost = _expected_cost_over_df(df, q_final, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
             print(f"Two-sided gated (τ_hi={tau_hi:.2f}, τ_lo={tau_lo:.2f}) -> expected cost={best_cost:.2f}")
         # write submission
         out_path = args.submit_blended or (args.submit if args.submit else "orders_blended_two_sided.csv")
