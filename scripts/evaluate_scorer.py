@@ -219,6 +219,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate trained edge scorer on test set")
     parser.add_argument("--graph", type=str, required=True, help="Path to JSONL graph")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to trained checkpoint")
+    parser.add_argument("--as-of", type=str, default=None, help="Temporal boundary (YYYY-MM-DD): no data after this date")
     parser.add_argument("--train-end", type=str, default="2024-01-31")
     parser.add_argument("--val-end", type=str, default="2024-03-15")
     parser.add_argument("--hops", type=int, default=2)
@@ -226,6 +227,10 @@ def main():
     parser.add_argument("--time-aware", action="store_true")
     parser.add_argument("--calibrator", type=str, default=None, help="Path to a saved isotonic calibrator (pickle)")
     args = parser.parse_args()
+    
+    # P0: as-of validation
+    if args.as_of and args.val_end > args.as_of:
+        raise ValueError(f"--val-end ({args.val_end}) cannot be after --as-of ({args.as_of})")
 
     evaluate_scorer(
         args.graph,

@@ -330,11 +330,60 @@ def _merge_state(df: pd.DataFrame, state_path: str | None) -> pd.DataFrame:
     return out
 
 
+def apply_blend_guardrails(
+    q: np.ndarray,
+    mu_H: np.ndarray,
+    p_t3: np.ndarray,
+    classes: np.ndarray,
+    horizon: int = 3,
+    last_order: np.ndarray | None = None
+) -> np.ndarray:
+    """
+    Apply defensive caps to prevent spikes (P1 blend guards).
+    
+    Guards:
+    1. Velocity cap: q <= p95(mu_H) * horizon (prevent extreme outliers)
+    2. Slope cap: q <= last_order * 1.8 + 15 (relaxed for A/X class)
+    3. Triage floor: if p_t3 >= 0.6 and q == 0, set q = 1 (cold-start safety)
+    
+    Args:
+        q: Proposed order quantities
+        mu_H: Horizon mean demand
+        p_t3: Week-3 activation probability
+        classes: ABC class labels
+        horizon: Horizon weeks
+        last_order: Optional array of last period's orders
+    
+    Returns:
+        Capped order quantities
+    """
+    q_out = q.copy()
+    
+    # 1. Velocity cap (global p95)
+    velocity_cap = np.quantile(mu_H, 0.95) * horizon
+    q_out = np.minimum(q_out, velocity_cap)
+    
+    # 2. Slope cap (if last_order provided, relax for A-class)
+    if last_order is not None:
+        slope_cap = last_order * 1.8 + 15
+        # Relax for A-class
+        is_A_or_X = (classes == "A") | (classes == "X")
+        slope_cap[is_A_or_X] = last_order[is_A_or_X] * 2.5 + 30
+        q_out = np.minimum(q_out, slope_cap)
+    
+    # 3. Triage floor (high-p cold-start)
+    cold_start_mask = (p_t3 >= 0.6) & (q_out == 0)
+    q_out[cold_start_mask] = 1
+    
+    return q_out.astype(int)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate VN2 order features from scorer + calibration")
     ap.add_argument("--graph", required=True, type=str)
     ap.add_argument("--ckpt", required=True, type=str)
     ap.add_argument("--calibrator", default=None, type=str)
+    ap.add_argument("--as-of", type=str, default=None, help="Temporal boundary (YYYY-MM-DD or YYYYMMDD): no predictions after this date")
     ap.add_argument("--train-end", default="2024-01-31", type=str)
     ap.add_argument("--start-week", default=None, type=str, help="YYYYMMDD start week (default: next Monday after train_end)")
     ap.add_argument("--horizon", default=3, type=int)
@@ -346,6 +395,7 @@ def main():
     ap.add_argument("--submit", default=None, type=str, help="If provided, write 599-row orders.csv here with order_qty column")
     ap.add_argument("--beta", default=0.833, type=float, help="Critical fractile (default 1/(1+0.2))")
     ap.add_argument("--features-599", default=None, type=str, help="If provided, write 599-row features aligned to index (includes p_t1..p_t3)")
+    ap.add_argument("--features-only", action="store_true", help="Generate features only; skip all blending logic (for HB integration)")
     ap.add_argument("--blend", default="none", choices=["none","hb","graph","gated","gated2","shrink","cap","mixture","mixture_min"], help="Blend submission strategy")
     ap.add_argument("--hb", default=None, type=str, help="Path to HB submission CSV (store_id,product_id,order_qty)")
     ap.add_argument("--tau", default=0.6, type=float, help="Gating threshold on p_t3 for blend=gated")
@@ -371,6 +421,16 @@ def main():
     ap.add_argument("--cost-holding", type=float, default=0.2, help="Holding cost per unit per week for grid cost proxy")
     ap.add_argument("--sanity-k", type=int, default=50, help="Top/Bottom K for sanity keep/shrink checks")
     args = ap.parse_args()
+    
+    # P0: as-of validation
+    if args.as_of:
+        start_week_str = str(args.start_week) if args.start_week else "unknown"
+        if start_week_str != "unknown":
+            # Convert YYYYMMDD to YYYY-MM-DD for comparison
+            sw = start_week_str.replace("-", "")
+            asof = str(args.as_of).replace("-", "")
+            if sw > asof:
+                raise ValueError(f"--start-week ({start_week_str}) cannot be after --as-of ({args.as_of})")
 
     print(f"Loading graph from {args.graph}...")
     G = load_graph(args.graph, multi=True)
@@ -424,9 +484,16 @@ def main():
             # Zero-inflated mixture across horizon
             mu_H = 0.0
             var_H = 0.0
+            # P1: Compute per-week moments (mu_wk, sigma_wk) to avoid i.i.d. assumption
+            mu_weeks = []
+            sigma_weeks = []
             for prob in p_list:
-                mu_H += prob * prod_mu
-                var_H += prob * (prod_sigma ** 2) + prob * (1 - prob) * (prod_mu ** 2)
+                mu_w = prob * prod_mu
+                var_w = prob * (prod_sigma ** 2) + prob * (1 - prob) * (prod_mu ** 2)
+                mu_weeks.append(mu_w)
+                sigma_weeks.append(math.sqrt(max(1e-6, var_w)))
+                mu_H += mu_w
+                var_H += var_w
 
             row = {
                 "store_id": s.replace("store:", ""),
@@ -440,6 +507,13 @@ def main():
                 "p_t3": p_weeks[2] if len(p_weeks) > 2 else (p_weeks[-1] if p_weeks else 0.0),
                 "mu_hat_plus": prod_mu,
                 "sigma_hat_plus": prod_sigma,
+                # P1: Weekly moments (avoid i.i.d. assumption for HB covariates)
+                "mu_w1": mu_weeks[0] if len(mu_weeks) > 0 else 0.0,
+                "mu_w2": mu_weeks[1] if len(mu_weeks) > 1 else 0.0,
+                "mu_w3": mu_weeks[2] if len(mu_weeks) > 2 else 0.0,
+                "sigma_w1": sigma_weeks[0] if len(sigma_weeks) > 0 else 0.0,
+                "sigma_w2": sigma_weeks[1] if len(sigma_weeks) > 1 else 0.0,
+                "sigma_w3": sigma_weeks[2] if len(sigma_weeks) > 2 else 0.0,
                 "mu_H": mu_H,
                 "sigma_H": math.sqrt(max(1e-6, var_H)),
             }
@@ -452,6 +526,22 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print("Done.")
+    
+    # P0: Write meta.json for features artifact
+    from graph_qa.meta import write_meta_json
+    write_meta_json(
+        output_path=args.out,
+        as_of=args.as_of or "unknown",
+        train_end=args.train_end,
+        horizon=args.horizon,
+        hops=args.hops,
+        K=args.K,
+        counts={"total_pairs": len(rows)},
+        extra={
+            "start_week": start_week,
+            "calibrator": args.calibrator if args.calibrator else None,
+        }
+    )
 
     # Optional: produce 599-row submission file in platform order
     # Optionally write 599-row features aligned to index
@@ -463,7 +553,8 @@ def main():
             feat_map[(str(r["store_id"]), str(r["product_id"]))] = r
         with open(args.submission_index, "r") as idxf, open(args.features_599, "w", newline="") as outf:
             idxr = csv.DictReader(idxf)
-            fieldnames = ["store_id","product_id","p_t1","p_t2","p_t3","mu_hat_plus","sigma_hat_plus","mu_H","sigma_H"]
+            fieldnames = ["store_id","product_id","p_t1","p_t2","p_t3","mu_hat_plus","sigma_hat_plus",
+                         "mu_w1","mu_w2","mu_w3","sigma_w1","sigma_w2","sigma_w3","mu_H","sigma_H"]
             writer = csv.DictWriter(outf, fieldnames=fieldnames)
             writer.writeheader()
             count = 0
@@ -479,11 +570,22 @@ def main():
                     "p_t3": feat.get("p_t3", 0.0),
                     "mu_hat_plus": feat.get("mu_hat_plus", 0.0),
                     "sigma_hat_plus": feat.get("sigma_hat_plus", 0.0),
+                    "mu_w1": feat.get("mu_w1", 0.0),
+                    "mu_w2": feat.get("mu_w2", 0.0),
+                    "mu_w3": feat.get("mu_w3", 0.0),
+                    "sigma_w1": feat.get("sigma_w1", 0.0),
+                    "sigma_w2": feat.get("sigma_w2", 0.0),
+                    "sigma_w3": feat.get("sigma_w3", 0.0),
                     "mu_H": feat.get("mu_H", 0.0),
                     "sigma_H": feat.get("sigma_H", 0.0),
                 })
                 count += 1
         print(f"Wrote {count} feature rows to {args.features_599}")
+    
+    # P1: Early return if features-only mode
+    if args.features_only:
+        print("✅ Features-only mode: skipping blend logic")
+        return
 
     # === τ/α grid (if requested) — skip for gated2 (two-sided policy has its own grid) ===
     if args.grid and args.blend != "gated2":
@@ -669,6 +771,17 @@ def main():
             best_tau_hi, best_tau_lo = tau_hi, tau_lo
             best_cost = _expected_cost_over_df(df, q_final, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
             print(f"Two-sided gated (τ_hi={tau_hi:.2f}, τ_lo={tau_lo:.2f}) -> expected cost={best_cost:.2f}")
+        
+        # P1: Apply blend guardrails (velocity/slope caps, triage floor)
+        q_final = apply_blend_guardrails(
+            q=q_final,
+            mu_H=mu_H_arr,
+            p_t3=p,
+            classes=classes,
+            horizon=int(args.horizon),
+            last_order=hbq  # Use HB as "last order" proxy
+        )
+        
         # write submission
         out_path = args.submit_blended or (args.submit if args.submit else "orders_blended_two_sided.csv")
         _ensure_parent_dir(out_path)
@@ -676,6 +789,25 @@ def main():
         out["order_qty"] = q_final
         out.to_csv(out_path, index=False)
         print(f"Wrote blended submission {out_path} with {len(out)} rows (strategy=gated2).")
+        
+        # P1: Export decision trace for top-N SKUs
+        trace = df[["store_id", "product_id"]].copy()
+        trace["hb_qty"] = hbq
+        trace["graph_qty"] = q_graph
+        trace["final_qty"] = q_final
+        trace["p_t3"] = p
+        trace["mu_H"] = mu_H_arr
+        trace["class"] = classes
+        trace["reason"] = "keep"
+        trace.loc[q_final > hbq, "reason"] = "lift"
+        trace.loc[q_final < hbq, "reason"] = "cap"
+        # Export top 100 by |final - hb|
+        trace["delta"] = np.abs(q_final - hbq)
+        trace_top = trace.nlargest(100, "delta")
+        trace_path = Path(out_path).parent / f"{Path(out_path).stem}_trace.csv"
+        trace_top.to_csv(trace_path, index=False)
+        print(f"📋 Decision trace (top-100 changes): {trace_path}")
+        
         # sanity
         try:
             top_idx = np.argsort(-p)[:50]

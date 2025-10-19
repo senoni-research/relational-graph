@@ -31,6 +31,7 @@ def main():
     p = argparse.ArgumentParser(description="Fit isotonic calibrator on validation window")
     p.add_argument("--graph", required=True, type=str)
     p.add_argument("--ckpt", required=True, type=str)
+    p.add_argument("--as-of", type=str, default=None, help="Temporal boundary (YYYY-MM-DD): no data after this date")
     p.add_argument("--train-end", default="2024-01-31", type=str)
     p.add_argument("--val-end", default="2024-03-15", type=str)
     p.add_argument("--hops", default=1, type=int)
@@ -40,6 +41,10 @@ def main():
     p.add_argument("--input-space", type=str, default="prob", choices=["prob", "logit"], help="Calibrator input space")
     p.add_argument("--out", required=True, type=str)
     args = p.parse_args()
+    
+    # P0: as-of validation
+    if args.as_of and args.val_end > args.as_of:
+        raise ValueError(f"--val-end ({args.val_end}) cannot be after --as-of ({args.as_of})")
 
     print(f"Loading graph from {args.graph}...")
     G = load_graph(args.graph, multi=True)
@@ -115,10 +120,53 @@ def main():
         lr.fit(X, y)
         model_obj = lr
 
+    # P0: Export calibration reliability report
+    from graph_qa.calibration_metrics import export_calibration_report
+    import numpy as np
+    
+    # Apply calibrator and compute post-calibration metrics
+    if args.input_space == "logit":
+        cal_input = np.array(logits).reshape(-1, 1) if args.calibration_method == "platt" else logits
+    else:
+        cal_input = np.array(probs).reshape(-1, 1) if args.calibration_method == "platt" else probs
+    
+    if hasattr(model_obj, "transform"):
+        calibrated_probs = model_obj.transform(cal_input)
+    else:
+        calibrated_probs = model_obj.predict_proba(cal_input)[:, 1]
+    
+    report_dir = Path(args.out).parent
+    report = export_calibration_report(
+        y_true=np.array(labels),
+        y_pred=calibrated_probs,
+        output_dir=report_dir,
+        name=Path(args.out).stem,
+        n_bins=10
+    )
+    
     Path(os.path.dirname(args.out)).mkdir(parents=True, exist_ok=True)
     with open(args.out, "wb") as f:
         pickle.dump({"method": meta["method"], "input": meta["input"], "model": model_obj}, f)
     print(f"Saved calibrator to {args.out} ({meta['method']}, input={meta['input']})")
+    
+    # P0: Write calibrator meta.json
+    from graph_qa.meta import write_meta_json
+    write_meta_json(
+        output_path=args.out,
+        as_of=args.as_of or args.val_end,
+        train_end=args.train_end,
+        val_end=args.val_end,
+        hops=args.hops,
+        K=args.K,
+        counts={"val_samples": len(val_data)},
+        extra={
+            "method": args.calibration_method,
+            "input_space": args.input_space,
+            "time_aware": args.time_aware,
+            "ece": report["ece"],
+            "brier": report["brier"],
+        }
+    )
 
 
 if __name__ == "__main__":
