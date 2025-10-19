@@ -151,7 +151,9 @@ def _expected_cost(mu_H: np.ndarray, sigma_H: np.ndarray, S: np.ndarray, cost_sh
     under[small] = np.maximum(0.0, mu_H[small] - S[small])
     over[small]  = np.maximum(0.0, S[small] - mu_H[small])
     Cu = float(cost_shortage)
-    CoH = float(cost_holding_per_week) * float(horizon)
+    # Time-weight holding over the horizon: average carry ~ horizon/2 (e.g., 1.5 weeks for H=3)
+    w_bar = 0.5 * float(horizon)
+    CoH = float(cost_holding_per_week) * w_bar
     return float(np.sum(Cu * under + CoH * over))
 
 def _expected_cost_over_df(df: pd.DataFrame, q: np.ndarray, cost_shortage: float, cost_holding_per_week: float, horizon: int) -> float:
