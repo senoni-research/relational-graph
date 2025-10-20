@@ -22,6 +22,7 @@ import csv
 import math
 import pickle
 from datetime import date, timedelta
+from pathlib import Path
 import os
 from typing import Dict, Tuple, Any
 import numpy as np
@@ -166,6 +167,61 @@ def _expected_cost_over_df(df: pd.DataFrame, q: np.ndarray, cost_shortage: float
     onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
     S = onhand + onorder + np.asarray(q, dtype=float)
     return _expected_cost(mu_H_arr, sigma_H_arr, S, cost_shortage, cost_holding_per_week, horizon)
+
+# Weekly dynamic expected cost (per competition rules): holding charged each week on carry, inventory carries week-to-week
+def _expected_cost_weekly_over_df(df: pd.DataFrame, q: np.ndarray, cost_shortage: float, cost_holding_per_week: float, horizon: int) -> float:
+    # Build weekly means/standards; fall back to horizon moments if weekly columns missing
+    def _col_safe(name: str, default: float) -> np.ndarray:
+        return pd.to_numeric(df.get(name, default), errors="coerce").fillna(default).to_numpy()
+
+    if all(c in df.columns for c in ("mu_w1","mu_w2","mu_w3","sigma_w1","sigma_w2","sigma_w3")):
+        mu_w = np.vstack([
+            _col_safe("mu_w1", 0.0),
+            _col_safe("mu_w2", 0.0),
+            _col_safe("mu_w3", 0.0),
+        ])
+        sigma_w = np.vstack([
+            _col_safe("sigma_w1", 1e-6),
+            _col_safe("sigma_w2", 1e-6),
+            _col_safe("sigma_w3", 1e-6),
+        ])
+    else:
+        # Fallback: split horizon moment evenly (crude but safe)
+        mu_H = _col_safe("mu_H", 0.0)
+        sigma_H = _col_safe("sigma_H", 1e-6)
+        mu_eq = (mu_H / max(1, int(horizon)))
+        sig_eq = (sigma_H / max(1.0, math.sqrt(float(horizon))))
+        mu_w = np.vstack([mu_eq, mu_eq, mu_eq])
+        sigma_w = np.vstack([np.maximum(1e-6, sig_eq), np.maximum(1e-6, sig_eq), np.maximum(1e-6, sig_eq)])
+
+    # Extend/truncate to requested horizon
+    if int(horizon) > 3:
+        last_mu = mu_w[2]
+        last_sig = sigma_w[2]
+        extra_mu = [last_mu for _ in range(int(horizon) - 3)]
+        extra_sig = [last_sig for _ in range(int(horizon) - 3)]
+        mu_w = np.vstack([mu_w] + extra_mu)
+        sigma_w = np.vstack([sigma_w] + extra_sig)
+    elif int(horizon) < 3:
+        mu_w = mu_w[:int(horizon)]
+        sigma_w = sigma_w[:int(horizon)]
+
+    onhand = _col_safe("onhand", 0.0)
+    onorder = _col_safe("onorder_le2", 0.0)
+    a = onhand + onorder + np.asarray(q, dtype=float)
+    total = 0.0
+    Cu = float(cost_shortage)
+    Ch = float(cost_holding_per_week)
+    for t in range(int(horizon)):
+        mu = mu_w[t]
+        sigma = np.maximum(1e-8, sigma_w[t])
+        z = (a - mu) / sigma
+        over = sigma * _phi(z) + (a - mu) * _Phi(z)
+        under = sigma * _phi(z) + (mu - a) * (1.0 - _Phi(z))
+        total += float(np.sum(Cu * under + Ch * over))
+        # expected carry for next week
+        a = np.maximum(0.0, a - mu)
+    return total
 
 # Fast inverse normal CDF approximation (Abramowitz-Stegun style)
 def inv_norm_cdf(p: float) -> float:
@@ -637,7 +693,11 @@ def main():
                     onorder_series = df["onorder_le2"] if "onorder_le2" in df.columns else pd.Series(0.0, index=df.index)
                     onhand = pd.to_numeric(onhand_series, errors="coerce").fillna(0.0).to_numpy()
                     onorder = pd.to_numeric(onorder_series, errors="coerce").fillna(0.0).to_numpy()
-                    cost = _expected_cost(mu_H_arr, sigma_H_arr, onhand + onorder + q, args.cost_shortage, args.cost_holding, args.horizon)
+                    # Prefer weekly dynamic cost to match simulator
+                    df_cost = df.copy()
+                    df_cost["onhand"] = onhand
+                    df_cost["onorder_le2"] = onorder
+                    cost = _expected_cost_weekly_over_df(df_cost, q, args.cost_shortage, args.cost_holding, args.horizon)
                     score = cost
                     logs.append(f"α={alpha:.2f} cost={cost:.2f}")
                     better = cost < best_score
@@ -754,7 +814,7 @@ def main():
                 q_tmp[hi] = np.maximum(hbq[hi], q_graph[hi])
                 lo_mask = lo & (~isA)
                 q_tmp[lo_mask] = np.minimum(hbq[lo_mask], q_graph[lo_mask])
-                cost = _expected_cost_over_df(df, q_tmp, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
+                cost = _expected_cost_weekly_over_df(df, q_tmp, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
                 print(f"  τ_hi={tau_hi:.2f} (τ_lo={tau_lo:.2f}) -> cost={cost:.2f}")
                 if cost < best_cost:
                     best_cost, best_tau_hi, best_tau_lo, q_final = cost, tau_hi, tau_lo, q_tmp
@@ -771,7 +831,7 @@ def main():
             lo_mask = lo & (~isA)
             q_final[lo_mask] = np.minimum(hbq[lo_mask], q_graph[lo_mask])
             best_tau_hi, best_tau_lo = tau_hi, tau_lo
-            best_cost = _expected_cost_over_df(df, q_final, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
+            best_cost = _expected_cost_weekly_over_df(df, q_final, float(args.cost_shortage), float(args.cost_holding), int(args.horizon))
             print(f"Two-sided gated (τ_hi={tau_hi:.2f}, τ_lo={tau_lo:.2f}) -> expected cost={best_cost:.2f}")
         
         # P1: Apply blend guardrails (velocity/slope caps, triage floor)
