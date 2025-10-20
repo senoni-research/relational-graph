@@ -382,6 +382,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vn2-data-dir", type=str, default=str(Path(__file__).resolve().parents[2] / "vn2inventory" / "data"))
     ap.add_argument("--out", type=str, default=str(Path(__file__).resolve().parents[1] / "graph_qa" / "data" / "vn2_graph_sample.jsonl"))
     ap.add_argument("--max-pairs", type=int, default=200, help="Limit number of (Store,Product) pairs")
+    ap.add_argument("--as-of", type=str, default=None, help="Temporal boundary (YYYY-MM-DD or YYYYMMDD): no events after this date (required for production)")
     ap.add_argument("--start-date", type=str, default=None, help="Inclusive YYYY-MM-DD filter")
     ap.add_argument("--end-date", type=str, default=None, help="Inclusive YYYY-MM-DD filter")
     ap.add_argument("--include-sold-zeros", action="store_true", help="Keep zero-sales 'sold' edges regardless of inventory (default off)")
@@ -402,6 +403,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    
+    # P0: as-of enforcement (optional warning if not provided)
+    as_of_date = args.as_of
+    if as_of_date and args.end_date and args.end_date > as_of_date:
+        raise ValueError(f"--end-date ({args.end_date}) cannot be after --as-of ({as_of_date})")
+    
     data_dir = Path(args.vn2_data_dir)
     sales_path = data_dir / "Week 0 - 2024-04-08 - Sales.csv"
     stock_path = data_dir / "Week 0 - In Stock.csv"
@@ -463,6 +470,28 @@ def main() -> None:
     out_path = Path(args.out)
     write_jsonl(records, out_path)
     print(f"Wrote {out_path} with {len(records)} records")
+    
+    # P0: Write meta.json for reproducibility
+    from graph_qa.meta import write_meta_json
+    edge_records = [r for r in records if r.get("type") == "edge"]
+    node_records = [r for r in records if r.get("type") == "node"]
+    write_meta_json(
+        output_path=out_path,
+        as_of=as_of_date or args.end_date or "unknown",
+        counts={
+            "total_records": len(records),
+            "nodes": len(node_records),
+            "edges": len(edge_records),
+        },
+        extra={
+            "start_date": args.start_date,
+            "end_date": args.end_date,
+            "max_pairs": args.max_pairs if args.max_pairs > 0 else "unlimited",
+            "v2": args.v2,
+            "include_sold_zeros": args.include_sold_zeros,
+            "sold_zeros_if_instock": args.sold_zeros_if_instock,
+        }
+    )
 
 
 if __name__ == "__main__":
